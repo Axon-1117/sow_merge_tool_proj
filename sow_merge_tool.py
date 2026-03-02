@@ -23,11 +23,11 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-02-02.2114-debug19"
+APP_VERSION = "2026-03-02.perf1"
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
 _DEBUG_LOG_PATH = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_debug.log")
-_DEBUG_ENABLED = True  # keep on until we finish the only-diff toggle issue
+_DEBUG_ENABLED = False
 
 # Save performance: fast mode writes directly to target (faster, less safe than atomic replace)
 _FAST_SAVE_ENABLED = True
@@ -1080,6 +1080,9 @@ class SheetView:
         self._prefer_only_diff_when_ready = False
         self._diff_partial = False
         self._align_rows_enabled = True
+        # Set to True once initial diff data has been computed (background or manual).
+        # Prevents refresh(rescan=False) from triggering a full rescan on empty initial state.
+        self._data_ready = False
 
         # Rows that were modified via overwrite in this session.
         # In "只看差异" mode, we keep these rows visible even if diffs are resolved.
@@ -1958,6 +1961,17 @@ class SheetView:
             row = tuple(row) + (None,) * (self.max_col - len(row))
         return row
 
+    def _show_loading(self):
+        """Show a loading placeholder while background diff computation is in progress."""
+        try:
+            for w in (self.left, self.right):
+                w.configure(state="normal")
+                w.delete("1.0", "end")
+                w.insert("1.0", "计算中...\n")
+            self.info.configure(text="正在后台计算差异，请稍候...")
+        except Exception:
+            pass
+
     @staticmethod
     def _row_label(r: int | None) -> str:
         return str(r) if r is not None else ""
@@ -1988,9 +2002,19 @@ class SheetView:
             return []
 
         def _row_sig_list(ws, max_row_local: int):
+            # Read all rows in one pass (much faster than per-row iter_rows calls)
+            try:
+                all_rows = list(ws.iter_rows(
+                    min_row=1, max_row=max_row_local,
+                    min_col=1, max_col=self.max_col,
+                    values_only=True,
+                ))
+            except Exception:
+                all_rows = []
             sigs = []
-            for r in range(1, max_row_local + 1):
-                row = self._get_row_values(ws, r)
+            for row in all_rows:
+                if row is None:
+                    row = ()
                 sigs.append("\x1f".join(_merge_cmp_value(v) for v in row))
             return sigs
 
@@ -2079,12 +2103,24 @@ class SheetView:
         self._update_cursor_lines()
         self._update_diff_nav_state()
 
-        # Persist setting
+        # Persist setting (debounced: write 1 s after last toggle to avoid per-keypress I/O)
+        try:
+            self.app.only_diff_default = int(self.only_diff_var.get())
+            if hasattr(self, "_settings_save_id"):
+                try:
+                    self.frame.after_cancel(self._settings_save_id)
+                except Exception:
+                    pass
+            self._settings_save_id = self.frame.after(1000, self._flush_settings)
+        except Exception as e:
+            _dlog(f"settings debounce failed: {e}")
+
+    def _flush_settings(self):
+        """Debounced settings write: called 1 s after the last only-diff toggle."""
         try:
             os.makedirs(os.path.dirname(_SETTINGS_PATH), exist_ok=True)
             with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
                 json.dump({"only_diff": int(self.only_diff_var.get())}, f, ensure_ascii=False)
-            self.app.only_diff_default = int(self.only_diff_var.get())
         except Exception as e:
             _dlog(f"settings save failed: {e}")
 
@@ -2638,7 +2674,13 @@ class SheetView:
                 self._prefer_only_diff_when_ready = True
 
         # Full rescan diff map + cache row text if requested
-        if rescan or not self.pair_diff_cols:
+        # Use _data_ready flag instead of checking pair_diff_cols emptiness:
+        # pair_diff_cols can legitimately be empty (no diffs found) while still being valid data.
+        if rescan or not self._data_ready:
+            if not rescan:
+                # Data not yet ready (background computation still running).
+                # Skip this call; _apply_sheet_cache will call refresh() when done.
+                return
             self.pair_diff_cols = {}
             self.pair_text_a = {}
             self.pair_text_b = {}
@@ -2678,6 +2720,8 @@ class SheetView:
                     self.pair_diff_cols[idx] = cols
                     self.pair_text_a[idx] = line_a
                     self.pair_text_b[idx] = line_b
+
+            self._data_ready = True
 
         # Build display rows list (pair indices)
         if conflict_cells_by_row is not None:
@@ -2841,15 +2885,25 @@ class SheetView:
                 self.right.tag_remove("diffrow", "1.0", "end")
                 self.left.tag_remove("diffcell", "1.0", "end")
                 self.right.tag_remove("diffcell", "1.0", "end")
-                # apply cached tags
-                for line_idx in tag_rows:
-                    self.left.tag_add("diffrow", f"{line_idx}.0", f"{line_idx}.end")
-                    self.right.tag_add("diffrow", f"{line_idx}.0", f"{line_idx}.end")
-                for line_idx, spans_a, spans_b in tag_cells:
-                    for s, e in spans_a:
-                        self.left.tag_add("diffcell", f"{line_idx}.{s}", f"{line_idx}.{e}")
-                    for s, e in spans_b:
-                        self.right.tag_add("diffcell", f"{line_idx}.{s}", f"{line_idx}.{e}")
+                # apply cached tags in bulk (one Tcl call per tag per widget)
+                if tag_rows:
+                    cached_diffrow_args = []
+                    for line_idx in tag_rows:
+                        cached_diffrow_args.extend([f"{line_idx}.0", f"{line_idx}.end"])
+                    self.left.tag_add("diffrow", *cached_diffrow_args)
+                    self.right.tag_add("diffrow", *cached_diffrow_args)
+                if tag_cells:
+                    cached_cell_left = []
+                    cached_cell_right = []
+                    for line_idx, spans_a, spans_b in tag_cells:
+                        for s, e in spans_a:
+                            cached_cell_left.extend([f"{line_idx}.{s}", f"{line_idx}.{e}"])
+                        for s, e in spans_b:
+                            cached_cell_right.extend([f"{line_idx}.{s}", f"{line_idx}.{e}"])
+                    if cached_cell_left:
+                        self.left.tag_add("diffcell", *cached_cell_left)
+                    if cached_cell_right:
+                        self.right.tag_add("diffcell", *cached_cell_right)
 
                 mode = "只看差异" if self.only_diff_var.get() else "全量"
                 total_rows = len(self.row_pairs) if self.row_pairs else self.max_row
@@ -2896,13 +2950,16 @@ class SheetView:
         diff_row_count = 0
         tag_rows = []
         tag_cells = []
+        # Collect all tag ranges first; apply in bulk (one Tcl call per tag instead of N).
+        # tag_add(tagName, index1, *args) accepts multiple index pairs in a single call.
+        diffrow_args = []
+        diffcell_args_left = []
+        diffcell_args_right = []
         for line_idx, pair_idx in enumerate(self.display_rows, start=1):
             cols = self.pair_diff_cols.get(pair_idx, set())
             if cols:
                 diff_row_count += 1
-                # diff blocks
-                self.left.tag_add("diffrow", f"{line_idx}.0", f"{line_idx}.end")
-                self.right.tag_add("diffrow", f"{line_idx}.0", f"{line_idx}.end")
+                diffrow_args.extend([f"{line_idx}.0", f"{line_idx}.end"])
                 tag_rows.append(line_idx)
 
                 line_a = lines_a[line_idx - 1] if (line_idx - 1) < len(lines_a) else ""
@@ -2915,14 +2972,24 @@ class SheetView:
                 for c in cols:
                     if c in spans_a:
                         s, e = spans_a[c]
-                        self.left.tag_add("diffcell", f"{line_idx}.{s}", f"{line_idx}.{e}")
+                        diffcell_args_left.extend([f"{line_idx}.{s}", f"{line_idx}.{e}"])
                         spans_a_ranges.append((s, e))
                     if c in spans_b:
                         s, e = spans_b[c]
-                        self.right.tag_add("diffcell", f"{line_idx}.{s}", f"{line_idx}.{e}")
+                        diffcell_args_right.extend([f"{line_idx}.{s}", f"{line_idx}.{e}"])
                         spans_b_ranges.append((s, e))
                 if spans_a_ranges or spans_b_ranges:
                     tag_cells.append((line_idx, spans_a_ranges, spans_b_ranges))
+
+        # Apply all diffrow tags in one call per widget
+        if diffrow_args:
+            self.left.tag_add("diffrow", *diffrow_args)
+            self.right.tag_add("diffrow", *diffrow_args)
+        # Apply all diffcell tags in one call per widget
+        if diffcell_args_left:
+            self.left.tag_add("diffcell", *diffcell_args_left)
+        if diffcell_args_right:
+            self.right.tag_add("diffcell", *diffcell_args_right)
 
         mode = "只看差异" if self.only_diff_var.get() else "全量"
         total_rows = len(self.row_pairs) if self.row_pairs else self.max_row
@@ -3201,6 +3268,45 @@ class SowMergeApp:
             use_c = min(max_c, last_c + 50)
             return max(1, use_r), max(1, use_c)
 
+        def _compute_row_pairs_bg(ws_a, ws_b, max_row_a: int, max_row_b: int, max_col: int):
+            """Compute row alignment pairs using difflib.SequenceMatcher (background-safe)."""
+            def _bulk_sig_list(ws, max_row_local: int):
+                try:
+                    all_rows = list(ws.iter_rows(
+                        min_row=1, max_row=max_row_local,
+                        min_col=1, max_col=max_col,
+                        values_only=True,
+                    ))
+                except Exception:
+                    all_rows = []
+                return ["\x1f".join(_merge_cmp_value(v) for v in (row or ())) for row in all_rows]
+
+            sig_a = _bulk_sig_list(ws_a, max_row_a)
+            sig_b = _bulk_sig_list(ws_b, max_row_b)
+            sm = difflib.SequenceMatcher(a=sig_a, b=sig_b, autojunk=False)
+            pairs: list[tuple[int | None, int | None]] = []
+            for tag, i1, i2, j1, j2 in sm.get_opcodes():
+                if tag == "equal":
+                    for i, j in zip(range(i1, i2), range(j1, j2)):
+                        pairs.append((i + 1, j + 1))
+                elif tag == "replace":
+                    len_a = i2 - i1
+                    len_b = j2 - j1
+                    common = min(len_a, len_b)
+                    for k in range(common):
+                        pairs.append((i1 + k + 1, j1 + k + 1))
+                    for k in range(common, len_a):
+                        pairs.append((i1 + k + 1, None))
+                    for k in range(common, len_b):
+                        pairs.append((None, j1 + k + 1))
+                elif tag == "delete":
+                    for i in range(i1, i2):
+                        pairs.append((i + 1, None))
+                elif tag == "insert":
+                    for j in range(j1, j2):
+                        pairs.append((None, j + 1))
+            return pairs
+
         def _compute_sheet_cache(wb_a_val, wb_b_val, wb_a_edit, wb_b_edit, sheet: str):
             ws_a = wb_a_val[sheet]
             ws_b = wb_b_val[sheet]
@@ -3211,32 +3317,46 @@ class SowMergeApp:
             max_row = max(max_r_a, max_r_b)
             max_col = max(max_c_a, max_c_b)
 
-            diff_cols_by_row = {}
-            row_text_a = {}
-            row_text_b = {}
+            # Compute row-aligned pairs (same algorithm as SheetView._build_row_pairs)
+            row_pairs = _compute_row_pairs_bg(ws_a, ws_b, max_r_a, max_r_b, max_col)
 
-            for r_idx in range(1, max_row + 1):
+            pair_diff_cols: dict[int, set] = {}
+            pair_text_a: dict[int, str] = {}
+            pair_text_b: dict[int, str] = {}
+            row_a_to_pair_idx: dict[int, int] = {}
+            row_b_to_pair_idx: dict[int, int] = {}
+
+            for idx, (ra, rb) in enumerate(row_pairs):
+                if ra is not None:
+                    row_a_to_pair_idx[ra] = idx
+                if rb is not None:
+                    row_b_to_pair_idx[rb] = idx
                 cols = set()
                 parts_a = []
                 parts_b = []
                 for c in range(1, max_col + 1):
-                    da, db, eq = _cell_display_and_equal(ws_a, ws_b, ws_a_e, ws_b_e, r_idx, c)
+                    da, db, eq = _cell_display_and_equal_by_row(ws_a, ws_b, ws_a_e, ws_b_e, ra, rb, c)
                     parts_a.append(_val_to_str(da))
                     parts_b.append(_val_to_str(db))
                     if not eq:
                         cols.add(c)
-                diff_cols_by_row[r_idx] = cols
-                row_text_a[r_idx] = str(r_idx) + "\t" + "\t".join(parts_a)
-                row_text_b[r_idx] = str(r_idx) + "\t" + "\t".join(parts_b)
+                label_a = str(ra) if ra is not None else ""
+                label_b = str(rb) if rb is not None else ""
+                pair_text_a[idx] = label_a + "\t" + "\t".join(parts_a)
+                pair_text_b[idx] = label_b + "\t" + "\t".join(parts_b)
+                pair_diff_cols[idx] = cols
 
-            has_diff = any(bool(v) for v in diff_cols_by_row.values())
+            has_diff = any(bool(v) for v in pair_diff_cols.values())
             return {
                 "sheet": sheet,
                 "max_row": max_row,
                 "max_col": max_col,
-                "diff_cols_by_row": diff_cols_by_row,
-                "row_text_a": row_text_a,
-                "row_text_b": row_text_b,
+                "row_pairs": row_pairs,
+                "pair_diff_cols": pair_diff_cols,
+                "pair_text_a": pair_text_a,
+                "pair_text_b": pair_text_b,
+                "row_a_to_pair_idx": row_a_to_pair_idx,
+                "row_b_to_pair_idx": row_b_to_pair_idx,
                 "has_diff": has_diff,
             }
 
@@ -3245,17 +3365,28 @@ class SowMergeApp:
             view = self.sheet_views.get(sheet)
             if view is None:
                 return
-            if getattr(view, "_align_rows_enabled", False):
-                # Skip cached row-by-row diff when row alignment is enabled
+            # Skip if the user has made edits in this view; background data (from read-only copies)
+            # would be stale relative to the user's in-memory changes.
+            if getattr(view, "_data_ready", False) and view.touched_rows:
                 return
             view.max_row = cache["max_row"]
             view.max_col = cache["max_col"]
-            view.diff_cols_by_row = cache["diff_cols_by_row"]
-            view.row_text_a = cache["row_text_a"]
-            view.row_text_b = cache["row_text_b"]
-            view._diff_partial = False
             view._is_large_sheet = view.max_row >= _LARGE_SHEET_ROW_THRESHOLD
-            # render without rescan
+            view._bounds_checked = True
+
+            # Apply row-aligned pair data (computed in background with row alignment)
+            view.row_pairs = cache["row_pairs"]
+            view.pair_diff_cols = cache["pair_diff_cols"]
+            view.pair_text_a = cache["pair_text_a"]
+            view.pair_text_b = cache["pair_text_b"]
+            view.row_a_to_pair_idx = cache["row_a_to_pair_idx"]
+            view.row_b_to_pair_idx = cache["row_b_to_pair_idx"]
+            view._align_rows_enabled = True
+            view._diff_partial = False
+            # Mark data as ready so refresh(rescan=False) uses it without rescanning
+            view._data_ready = True
+            view._invalidate_render_cache()
+
             if view._prefer_only_diff_when_ready:
                 if cache.get("has_diff", False):
                     view.only_diff_var.set(1)
@@ -3329,8 +3460,10 @@ class SowMergeApp:
                     view = SheetView(self._sheet_containers[tab_text], self, tab_text)
                     self.sheet_views[tab_text] = view
                     self._sheet_loaded[tab_text] = True
-                    # Ensure initial render respects only-diff state immediately
-                    view.refresh(row_only=None, rescan=True)
+                    # Show loading placeholder immediately (non-blocking).
+                    # The background worker will compute diffs and call _apply_sheet_cache
+                    # which sets _data_ready=True and calls refresh(rescan=False).
+                    view._show_loading()
                 if tab_text in self._sheet_containers:
                     _enqueue_sheet(tab_text, front=True)
                     _kick_worker()
