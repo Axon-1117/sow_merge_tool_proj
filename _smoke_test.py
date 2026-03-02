@@ -36,18 +36,25 @@ if view is None:
         pass
     view = app.sheet_views[sheet]
 
-# Ensure initial diff map exists
+# Force synchronous rescan (rescan=True bypasses the background-wait guard)
 view.refresh(row_only=None, rescan=True)
-assert view.diff_cols_by_row[1], 'Row1 should have diff'
+assert view._data_ready, 'refresh(rescan=True) should set _data_ready'
+
+# Row 1 of A differs from row 1 of B (B1: 'y' vs 'Y'); look up via pair index
+pair_idx_r1 = view.row_a_to_pair_idx.get(1)
+assert pair_idx_r1 is not None, f'row 1 not found in row_a_to_pair_idx: {view.row_a_to_pair_idx}'
+assert view.pair_diff_cols.get(pair_idx_r1), f'Row1 should have diff; pair_diff_cols={view.pair_diff_cols}'
 
 view.only_diff_var.set(True)
 view._toggle_only_diff()
-assert 1 in view.display_rows, f'only-diff failed: {view.display_rows}'
+assert pair_idx_r1 in view.display_rows, f'only-diff failed: {view.display_rows}'
 
-view.selected_excel_row = 1
+# Select pair (row 1) and merge A -> B
+view.selected_pair_idx = pair_idx_r1
 view._copy_selected_row('A2B')
-# Snapshot mode may keep row visible; diff should be recomputed to empty after overwrite.
-assert not view.diff_cols_by_row[1], 'merge did not clear diff'
+# Snapshot mode keeps row visible; diff cols should be cleared after overwrite
+assert not view.pair_diff_cols.get(pair_idx_r1), \
+    f'merge did not clear diff; pair_diff_cols[{pair_idx_r1}]={view.pair_diff_cols.get(pair_idx_r1)}'
 
 app.root.destroy()
 print('SMOKE_TEST_OK')
