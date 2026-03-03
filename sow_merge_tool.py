@@ -1399,6 +1399,13 @@ class SheetView:
         self.left.tag_configure("diffcell", background="#FF2D2D")
         self.right.tag_configure("diffcell", background="#FF2D2D")
 
+        # Alignment padding: grey slot for rows that exist only on the other side.
+        # tag_raise ensures paddingrow background overrides diffrow on the empty slot.
+        self.left.tag_configure("paddingrow", background="#A0A0A0")
+        self.right.tag_configure("paddingrow", background="#A0A0A0")
+        self.left.tag_raise("paddingrow")
+        self.right.tag_raise("paddingrow")
+
         # selection should not overwrite diff colors
         self.left.tag_configure("selrow", underline=1, font=("Consolas", 11, "bold"))
         self.right.tag_configure("selrow", underline=1, font=("Consolas", 11, "bold"))
@@ -2883,6 +2890,8 @@ class SheetView:
                 self.right.tag_remove("diffrow", "1.0", "end")
                 self.left.tag_remove("diffcell", "1.0", "end")
                 self.right.tag_remove("diffcell", "1.0", "end")
+                self.left.tag_remove("paddingrow", "1.0", "end")
+                self.right.tag_remove("paddingrow", "1.0", "end")
                 # apply cached tags in bulk (one Tcl call per tag per widget)
                 if tag_rows:
                     cached_diffrow_args = []
@@ -2903,6 +2912,22 @@ class SheetView:
                     if cached_cell_right:
                         self.right.tag_add("diffcell", *cached_cell_right)
 
+                # paddingrow: grey slot for one-sided pairs (computed from row_pairs, not cached)
+                _padding_left = []
+                _padding_right = []
+                for _i, _pidx in enumerate(self.display_rows):
+                    if _pidx < len(self.row_pairs):
+                        _ra, _rb = self.row_pairs[_pidx]
+                        _ln = _i + 1
+                        if _ra is None:
+                            _padding_left.extend([f"{_ln}.0", f"{_ln}.end"])
+                        elif _rb is None:
+                            _padding_right.extend([f"{_ln}.0", f"{_ln}.end"])
+                if _padding_left:
+                    self.left.tag_add("paddingrow", *_padding_left)
+                if _padding_right:
+                    self.right.tag_add("paddingrow", *_padding_right)
+
                 mode = "只看差异" if self.only_diff_var.get() else "全量"
                 total_rows = len(self.row_pairs) if self.row_pairs else self.max_row
                 self.info.configure(text=f"{mode} | RowsShown: {len(self.display_rows)} / {total_rows}   Cols: {self.max_col}   DiffRows: {diff_row_count}")
@@ -2919,6 +2944,8 @@ class SheetView:
         self.right.tag_remove("diffrow", "1.0", "end")
         self.left.tag_remove("diffcell", "1.0", "end")
         self.right.tag_remove("diffcell", "1.0", "end")
+        self.left.tag_remove("paddingrow", "1.0", "end")
+        self.right.tag_remove("paddingrow", "1.0", "end")
 
         # Build full text in memory and insert once (faster)
         lines_a = []
@@ -2988,6 +3015,21 @@ class SheetView:
             self.left.tag_add("diffcell", *diffcell_args_left)
         if diffcell_args_right:
             self.right.tag_add("diffcell", *diffcell_args_right)
+        # Apply paddingrow (grey) to empty slots of one-sided pairs
+        _padding_left = []
+        _padding_right = []
+        for _i, _pidx in enumerate(self.display_rows):
+            if _pidx < len(self.row_pairs):
+                _ra, _rb = self.row_pairs[_pidx]
+                _ln = _i + 1
+                if _ra is None:
+                    _padding_left.extend([f"{_ln}.0", f"{_ln}.end"])
+                elif _rb is None:
+                    _padding_right.extend([f"{_ln}.0", f"{_ln}.end"])
+        if _padding_left:
+            self.left.tag_add("paddingrow", *_padding_left)
+        if _padding_right:
+            self.right.tag_add("paddingrow", *_padding_right)
 
         mode = "只看差异" if self.only_diff_var.get() else "全量"
         total_rows = len(self.row_pairs) if self.row_pairs else self.max_row
@@ -3463,8 +3505,12 @@ class SowMergeApp:
                     # which sets _data_ready=True and calls refresh(rescan=False).
                     view._show_loading()
                 if tab_text in self._sheet_containers:
-                    _enqueue_sheet(tab_text, front=True)
-                    _kick_worker()
+                    # Skip background recompute if data is already ready (no edits pending).
+                    # Reopening workbooks on every tab switch is the main perf regression.
+                    _view = self.sheet_views.get(tab_text)
+                    if not (_view and getattr(_view, "_data_ready", False)):
+                        _enqueue_sheet(tab_text, front=True)
+                        _kick_worker()
             except Exception as e:
                 _dlog(f"tab changed handler failed: {e}")
 
