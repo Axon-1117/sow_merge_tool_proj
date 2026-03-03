@@ -46,7 +46,7 @@ jobs:
         uses: openai/codex-action@main
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
-          prompt: |`n            Review this repository changes as a practical senior engineer. List high-severity findings first.
+          prompt-file: .github/codex/review_prompt.md
           codex-args: >-
             --quiet
 
@@ -95,7 +95,3 @@ jobs:
                 body,
               });
             }
-
-
-
-
