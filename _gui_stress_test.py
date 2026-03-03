@@ -87,8 +87,6 @@ def main():
     make_big_xlsx(fb, sheets, rows, cols, diff=True, diff_every=diff_every, diff_col_every=diff_col_every)
     t2 = time.perf_counter()
 
-    import sys
-    sys.path.insert(0, r"D:\Tools\sow_merge_tool")
     import sow_merge_tool as mod
 
     t3 = time.perf_counter()

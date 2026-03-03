@@ -45,8 +45,6 @@ def main():
     _make_xlsx(fa, a_rows)
     _make_xlsx(fb, b_rows)
 
-    import sys
-    sys.path.insert(0, r"D:\Tools\sow_merge_tool")
     import sow_merge_tool as mod
 
     app = mod.SowMergeApp(fa, fb)
@@ -63,17 +61,20 @@ def main():
         view = app.sheet_views[sheet]
 
     # Full mode
-    view.only_diff_var.set(False)
+    view.only_diff_var.set(0)
     view.refresh(row_only=None, rescan=True)
     full_count = len(view.display_rows)
     assert full_count == 5, f"Expected 5 rows shown, got {full_count}"
 
     # Only diff
-    view.only_diff_var.set(True)
+    view.only_diff_var.set(1)
     view._toggle_only_diff()
     diff_count = len(view.display_rows)
     assert diff_count == 1, f"Expected 1 diff row shown, got {diff_count}; display_rows={view.display_rows}"
-    assert view.display_rows[0] == 3, f"Expected diff row to be excel row 3, got {view.display_rows}"
+    pair_idx_row3 = view.row_a_to_pair_idx.get(3)
+    assert pair_idx_row3 is not None, "Expected row 3 to map to a pair index"
+    assert view.display_rows[0] == pair_idx_row3, \
+        f"Expected diff row pair index {pair_idx_row3}, got {view.display_rows}"
 
     try:
         app.root.destroy()

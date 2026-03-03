@@ -1,6 +1,5 @@
 from openpyxl import Workbook
 import os, tempfile
-import importlib.util
 
 # create two small workbooks in separate dirs but same basename
 root_a = tempfile.mkdtemp(prefix='sow_merge_testA_')
@@ -19,9 +18,7 @@ ws2['A1'] = 'x'; ws2['B1'] = 'Y'
 ws2['A2'] = 1; ws2['B2'] = 2
 wb2.save(fb)
 
-spec = importlib.util.spec_from_file_location('sow', r'D:\Tools\sow_merge_tool\sow_merge_tool.py')
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
+import sow_merge_tool as mod
 
 app = mod.SowMergeApp(fa, fb)
 
@@ -45,7 +42,7 @@ pair_idx_r1 = view.row_a_to_pair_idx.get(1)
 assert pair_idx_r1 is not None, f'row 1 not found in row_a_to_pair_idx: {view.row_a_to_pair_idx}'
 assert view.pair_diff_cols.get(pair_idx_r1), f'Row1 should have diff; pair_diff_cols={view.pair_diff_cols}'
 
-view.only_diff_var.set(True)
+view.only_diff_var.set(1)
 view._toggle_only_diff()
 assert pair_idx_r1 in view.display_rows, f'only-diff failed: {view.display_rows}'
 

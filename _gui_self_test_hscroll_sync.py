@@ -34,8 +34,6 @@ def main():
     _make_xlsx(fa, a_rows)
     _make_xlsx(fb, b_rows)
 
-    import sys
-    sys.path.insert(0, r"D:\Tools\sow_merge_tool")
     import sow_merge_tool as mod
 
     app = mod.SowMergeApp(fa, fb)

@@ -10,7 +10,6 @@ Run with: D:\\Tools\\sow_merge_tool\\.venv\\Scripts\\python.exe _smoke_test_curs
 
 from openpyxl import Workbook
 import os, tempfile
-import importlib.util
 
 root_a = tempfile.mkdtemp(prefix='sow_cursor_A_')
 root_b = tempfile.mkdtemp(prefix='sow_cursor_B_')
@@ -27,9 +26,7 @@ ws2['A1'] = 'x'; ws2['B1'] = 'Y'
 ws2['A2'] = 'right2'; ws2['B2'] = 'right2b'
 wb2.save(fb)
 
-spec = importlib.util.spec_from_file_location('sow', r'D:\Tools\sow_merge_tool\sow_merge_tool.py')
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
+import sow_merge_tool as mod
 
 app = mod.SowMergeApp(fa, fb)
 

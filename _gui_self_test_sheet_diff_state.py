@@ -48,8 +48,6 @@ def main():
     _make_xlsx(fa, sheets_a)
     _make_xlsx(fb, sheets_b)
 
-    import sys
-    sys.path.insert(0, r"D:\Tools\sow_merge_tool")
     import sow_merge_tool as mod
 
     app = mod.SowMergeApp(fa, fb)

@@ -10,7 +10,7 @@ from pywinauto import Application
 from pywinauto.timings import wait_until_passes
 
 
-EXE = r"D:\Tools\sow_merge_tool\dist\sow_merge_tool.exe"
+EXE = r"D:\Tools\sow_merge_tool_proj\dist\sow_merge_tool.exe"
 APP_TITLE_RE = r"sow_merge_tool.*"
 
 
