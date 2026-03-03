@@ -47,8 +47,6 @@ jobs:
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           prompt-file: .github/codex/review_prompt.md
-          codex-args: >-
-            --quiet
 
   post-review:
     runs-on: ubuntu-latest
