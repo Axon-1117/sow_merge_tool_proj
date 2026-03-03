@@ -30,6 +30,17 @@ jobs:
             exit 1
           fi
 
+      - name: Validate OpenAI API auth
+        run: |
+          status=$(curl -s -o /tmp/openai_auth.json -w "%{http_code}" \
+            https://api.openai.com/v1/models \
+            -H "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}")
+          if [ "$status" != "200" ]; then
+            echo "::error::OpenAI API auth failed with HTTP $status"
+            cat /tmp/openai_auth.json
+            exit 1
+          fi
+
       - name: Run Codex review
         id: run_codex
         uses: openai/codex-action@v1
@@ -84,4 +95,5 @@ jobs:
                 body,
               });
             }
+
 
