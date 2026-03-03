@@ -23,6 +23,13 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v5
 
+      - name: Validate OPENAI_API_KEY
+        run: |
+          if [ -z "${{ secrets.OPENAI_API_KEY }}" ]; then
+            echo "::error::OPENAI_API_KEY is empty or not available to this workflow."
+            exit 1
+          fi
+
       - name: Run Codex review
         id: run_codex
         uses: openai/codex-action@v1
@@ -77,3 +84,4 @@ jobs:
                 body,
               });
             }
+
