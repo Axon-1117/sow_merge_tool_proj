@@ -1588,8 +1588,7 @@ class SheetView:
     def _pair_idx_for_line(self, line: int) -> int | None:
         if not (1 <= line <= len(self.display_rows)):
             return None
-        pair = self._pair_for_line(line)
-        return self._row_for_side(pair, "B")
+        return self.display_rows[line - 1]
 
     def _pair_for_line(self, line: int):
         idx = self._pair_idx_for_line(line)
@@ -3436,6 +3435,13 @@ class SowMergeApp:
                     view._render_limit = min(_LARGE_SHEET_INITIAL_ROWS, view.max_row)
                 view._prefer_only_diff_when_ready = False
             view.refresh(row_only=None, rescan=False)
+            # Reset cursor to line 1 after full re-render so _update_cursor_lines
+            # shows row 1 instead of a stale/out-of-range position.
+            try:
+                view.left.mark_set("insert", "1.0")
+                view.right.mark_set("insert", "1.0")
+            except Exception:
+                pass
             view._update_cursor_lines()
 
         def _compute_worker():
