@@ -2276,22 +2276,20 @@ class SheetView:
                 return
 
             if direction == "A2B":
-                if resolved_only:
-                    # No write-back needed; keep mine but allow UI refresh below.
-                    pass
-                undo_cells = []
-                for c in cols:
-                    old_edit = ws_b_edit.cell(row=dst_r, column=c).value
-                    old_val = ws_b_val.cell(row=dst_r, column=c).value
-                    v_edit = ws_a_edit.cell(row=src_r, column=c).value
-                    v_val = ws_a_val.cell(row=src_r, column=c).value
-                    ws_b_edit.cell(row=dst_r, column=c).value = v_val if _USE_CACHED_VALUES_ONLY else v_edit
-                    ws_b_val.cell(row=dst_r, column=c).value = v_val
-                    undo_cells.append((dst_r, c, old_edit, old_val))
-                self.app.modified_b = True
-                self.app.modified_sheets_b.add(self.sheet)
-                if undo_cells:
-                    self.app.push_undo({"sheet": self.sheet, "target": "B", "cells": undo_cells})
+                if not resolved_only:
+                    undo_cells = []
+                    for c in cols:
+                        old_edit = ws_b_edit.cell(row=dst_r, column=c).value
+                        old_val = ws_b_val.cell(row=dst_r, column=c).value
+                        v_edit = ws_a_edit.cell(row=src_r, column=c).value
+                        v_val = ws_a_val.cell(row=src_r, column=c).value
+                        ws_b_edit.cell(row=dst_r, column=c).value = v_val if _USE_CACHED_VALUES_ONLY else v_edit
+                        ws_b_val.cell(row=dst_r, column=c).value = v_val
+                        undo_cells.append((dst_r, c, old_edit, old_val))
+                    self.app.modified_b = True
+                    self.app.modified_sheets_b.add(self.sheet)
+                    if undo_cells:
+                        self.app.push_undo({"sheet": self.sheet, "target": "B", "cells": undo_cells})
             else:
                 undo_cells = []
                 for c in cols:
