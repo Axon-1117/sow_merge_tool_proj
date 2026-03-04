@@ -10,6 +10,8 @@ from datetime import datetime
 import time
 import stat
 import shutil
+import zipfile
+import platform
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -24,11 +26,12 @@ from openpyxl.utils import get_column_letter
 
 APP_NAME = "sow_merge_tool"
 APP_VERSION = "2026-03-02.perf1"
-APP_BUILD_TAG = "new11-3way-preview"
+APP_BUILD_TAG = "new46-copy-feedback-info"
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
 _DEBUG_LOG_PATH = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_debug.log")
-_DEBUG_ENABLED = False
+_DEBUG_ENABLED = True
+_LAUNCH_TRACE_PATH = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_launch_trace.log")
 
 # Save performance: fast mode writes directly to target (faster, less safe than atomic replace)
 _FAST_SAVE_ENABLED = True
@@ -42,6 +45,7 @@ _USE_CACHED_VALUES_ONLY = True
 # When cached values are missing for formulas, try to recalc via Excel (if available)
 _AUTO_RECALC_MISSING_CACHE = False
 _AUTO_RECALC_FORMULAS_ALWAYS = False
+_AUTO_RECALC_ON_OPEN = True
 _CACHE_CHECK_MAX_CELLS = 3000
 # Render performance: limit initial rows rendered (user can load full)
 _FAST_RENDER_ROW_LIMIT = 800
@@ -50,7 +54,14 @@ _LARGE_SHEET_ROW_THRESHOLD = 1000
 _LARGE_SHEET_INITIAL_ROWS = 200
 _LARGE_SHEET_BLOCK_ROWS = 1000
 _LARGE_SHEET_DIRECT_PAIR_THRESHOLD = 5000
+_ROW_ALIGN_MAX_ROWS = 1000
 _TABMARK_QUICK_TAIL_ROWS = 2000
+
+# Unified pane colors (main 3-way panes and C-area rows)
+_MINE_BG = "#F6C16B"
+_BASE_BG = "#E3E3FF"
+_THEIRS_BG = "#FFF176"
+_DIFF_CELL_BG = "#FF2D2D"
 
 # Settings (persist UI prefs)
 _SETTINGS_PATH = os.path.join(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()), APP_NAME, "settings.json")
@@ -496,6 +507,77 @@ def _try_export_svn_revision_from_merge_temp(path: str) -> str:
 
 
 
+def _try_export_svn_base_from_working_copy(path: str) -> str | None:
+    """Export BASE revision for a working-copy file path.
+
+    Returns exported temp .xlsx path when successful, otherwise None.
+    """
+    try:
+        if not path:
+            return None
+        p = os.path.abspath(path)
+        if not os.path.exists(p):
+            return None
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_name = os.path.basename(p)
+        save_path = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_svncat_BASE_{ts}_{base_name}")
+        if not save_path.lower().endswith(".xlsx"):
+            save_path += ".xlsx"
+
+        # Prefer svn CLI (usually uses WC metadata for BASE).
+        svn_exe = shutil.which("svn")
+        if svn_exe:
+            try:
+                no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                with open(save_path, "wb") as f:
+                    r = subprocess.run(
+                        [svn_exe, "cat", "-r", "BASE", p],
+                        stdout=f,
+                        stderr=subprocess.PIPE,
+                        timeout=30,
+                        creationflags=no_window,
+                    )
+                if r.returncode == 0 and os.path.exists(save_path) and os.path.getsize(save_path) > 0:
+                    _dlog(f"svn base export(cli): {p} -> {save_path}")
+                    return save_path
+                try:
+                    if os.path.exists(save_path):
+                        os.remove(save_path)
+                except Exception:
+                    pass
+                _dlog(
+                    f"svn base export(cli) failed: rc={r.returncode} "
+                    f"err={(r.stderr or b'').decode('utf-8', errors='ignore')}"
+                )
+            except Exception as e:
+                _dlog(f"svn base export(cli) exception: {e}")
+
+        # Fallback: TortoiseProc cat BASE
+        try:
+            proc_exe = _find_tortoise_proc_exe()
+            subprocess.Popen([
+                proc_exe,
+                "/command:cat",
+                f"/path:{p}",
+                "/revision:BASE",
+                f"/savepath:{save_path}",
+                "/closeonend:1",
+            ])
+            for _ in range(50):
+                if os.path.exists(save_path) and os.path.getsize(save_path) > 0:
+                    _dlog(f"svn base export(tortoise): {p} -> {save_path}")
+                    return save_path
+                time.sleep(0.1)
+        except Exception as e:
+            _dlog(f"svn base export(tortoise) exception: {e}")
+            return None
+    except Exception as e:
+        _dlog(f"svn base export error: {e}")
+        return None
+    return None
+
+
 def _find_handle_exe():
     candidates = [
         os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "handle.exe"),
@@ -654,6 +736,14 @@ def pick_two_files_same_name():
 
 
 def _detect_svn_conflict_files(target_path: str):
+    # If user selected a conflict artifact directly, map back to merged target first.
+    try:
+        p = os.path.abspath(target_path)
+        m = re.match(r"^(?P<base>.+)\.merge-(left|right)\.r\d+$", p, flags=re.IGNORECASE)
+        if m:
+            target_path = m.group("base")
+    except Exception:
+        pass
     folder = os.path.dirname(target_path)
     base_name = os.path.basename(target_path)
     # SVN conflict artifacts:
@@ -703,7 +793,50 @@ def _detect_svn_conflict_files(target_path: str):
     r_new = os.path.join(folder, base_name + ".rNEW")
     if os.path.exists(r_old) and os.path.exists(r_new):
         return r_old, target_path, r_new, target_path
+    # Fallback: fuzzy match for temp-stable names that still contain "<base>.merge-left/right.r####"
+    # e.g. sow_merge_tool_stable_..._<base>.merge-right.r27548_...
+    try:
+        merge_left_fuzzy = []
+        merge_right_fuzzy = []
+        key = (base_name + ".merge-").lower()
+        for name in os.listdir(folder):
+            low = name.lower()
+            if key not in low:
+                continue
+            i_left = low.find((base_name + ".merge-left.r").lower())
+            if i_left >= 0:
+                j = i_left + len((base_name + ".merge-left.r").lower())
+                rev = []
+                while j < len(low) and low[j].isdigit():
+                    rev.append(low[j])
+                    j += 1
+                if rev:
+                    merge_left_fuzzy.append((int("".join(rev)), os.path.join(folder, name)))
+            i_right = low.find((base_name + ".merge-right.r").lower())
+            if i_right >= 0:
+                j = i_right + len((base_name + ".merge-right.r").lower())
+                rev = []
+                while j < len(low) and low[j].isdigit():
+                    rev.append(low[j])
+                    j += 1
+                if rev:
+                    merge_right_fuzzy.append((int("".join(rev)), os.path.join(folder, name)))
+        if merge_left_fuzzy and merge_right_fuzzy:
+            merge_left_fuzzy.sort(key=lambda x: x[0])
+            merge_right_fuzzy.sort(key=lambda x: x[0])
+            return merge_left_fuzzy[-1][1], target_path, merge_right_fuzzy[-1][1], target_path
+    except Exception:
+        pass
     return None
+
+
+def _trace_launch(msg: str):
+    try:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        with open(_LAUNCH_TRACE_PATH, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {msg}\n")
+    except Exception:
+        pass
 
 
 def _has_svn_conflict_artifacts(target_path: str) -> bool:
@@ -765,6 +898,34 @@ def _auto_pick_conflict_file():
         p = _find_conflict_in_dir(cwd)
         if p:
             return p
+        try:
+            svn_exe = shutil.which("svn")
+            if svn_exe:
+                no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                r = subprocess.run(
+                    [svn_exe, "status", cwd],
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                    creationflags=no_window,
+                )
+                if r.returncode == 0:
+                    conflicted = []
+                    for line in (r.stdout or "").splitlines():
+                        if not line:
+                            continue
+                        if line[0] != "C":
+                            continue
+                        rel = line[8:].strip() if len(line) > 8 else ""
+                        if not rel:
+                            continue
+                        cand = os.path.abspath(os.path.join(cwd, rel))
+                        if os.path.exists(cand):
+                            conflicted.append(cand)
+                    if len(conflicted) == 1:
+                        return conflicted[0]
+        except Exception:
+            pass
         # Walk up to find SVN working copy root (.svn)
         cur = cwd
         wc_root = None
@@ -1032,6 +1193,94 @@ def _merge_three_way(base_path: str, mine_path: str, theirs_path: str, merged_pa
     return [], None, {}
 
 
+def _scan_three_way_conflicts(base_path: str, mine_path: str, theirs_path: str):
+    """Detect 3-way conflicts only; do NOT auto-apply theirs before UI."""
+    base_path = _ensure_xlsx_copy(base_path)
+    mine_path = _ensure_xlsx_copy(mine_path)
+    theirs_path = _ensure_xlsx_copy(theirs_path)
+
+    base_val_path = _prepare_val_path(base_path)
+    mine_val_path = _prepare_val_path(mine_path)
+    theirs_val_path = _prepare_val_path(theirs_path)
+
+    wb_base_val = load_workbook(base_val_path, data_only=True)
+    wb_mine_val = load_workbook(mine_val_path, data_only=True)
+    wb_theirs_val = load_workbook(theirs_val_path, data_only=True)
+    wb_mine_edit = load_workbook(mine_path, data_only=False)
+    wb_base_edit = load_workbook(base_path, data_only=False)
+    wb_theirs_edit = load_workbook(theirs_path, data_only=False)
+
+    conflicts = []
+    conflict_cells_by_sheet = {}
+
+    set_base = set(wb_base_val.sheetnames)
+    set_mine = set(wb_mine_val.sheetnames)
+    set_theirs = set(wb_theirs_val.sheetnames)
+    common = sorted(set_mine & set_theirs)
+
+    for name in common:
+        ws_b = wb_base_val[name] if name in set_base else None
+        ws_m = wb_mine_val[name]
+        ws_t = wb_theirs_val[name]
+        ws_m_e = wb_mine_edit[name]
+        ws_b_e = wb_base_edit[name] if name in wb_base_edit.sheetnames else None
+        ws_t_e = wb_theirs_edit[name] if name in wb_theirs_edit.sheetnames else None
+
+        max_row = max(ws_m.max_row or 1, ws_t.max_row or 1, (ws_b.max_row or 1) if ws_b else 1)
+        max_col = max(ws_m.max_column or 1, ws_t.max_column or 1, (ws_b.max_column or 1) if ws_b else 1)
+
+        it_m = ws_m.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col, values_only=True)
+        it_t = ws_t.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col, values_only=True)
+        it_b = ws_b.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col, values_only=True) if ws_b else ((None,) * max_col for _ in range(max_row))
+
+        for r, (row_m, row_t, row_b) in enumerate(zip(it_m, it_t, it_b), start=1):
+            if len(row_m) < max_col:
+                row_m = tuple(row_m) + (None,) * (max_col - len(row_m))
+            if len(row_t) < max_col:
+                row_t = tuple(row_t) + (None,) * (max_col - len(row_t))
+            if len(row_b) < max_col:
+                row_b = tuple(row_b) + (None,) * (max_col - len(row_b))
+
+            for c, (vm, vt, vb) in enumerate(zip(row_m, row_t, row_b), start=1):
+                vm_cmp = vm
+                vt_cmp = vt
+                vb_cmp = vb
+                try:
+                    if vm_cmp is None:
+                        vme = ws_m_e.cell(row=r, column=c).value
+                        if vme is not None and not _formula_text(vme):
+                            vm_cmp = vme
+                    if vt_cmp is None and ws_t_e is not None:
+                        vte = ws_t_e.cell(row=r, column=c).value
+                        if vte is not None and not _formula_text(vte):
+                            vt_cmp = vte
+                    if vb_cmp is None and ws_b_e is not None:
+                        vbe = ws_b_e.cell(row=r, column=c).value
+                        if vbe is not None and not _formula_text(vbe):
+                            vb_cmp = vbe
+                except Exception:
+                    pass
+                if vb_cmp is None and vt_cmp is not None and ws_b_e is not None and ws_t_e is not None:
+                    try:
+                        fb = _formula_text(ws_b_e.cell(row=r, column=c).value)
+                        ft = _formula_text(ws_t_e.cell(row=r, column=c).value)
+                        if fb and ft and fb == ft:
+                            vb_cmp = vt_cmp
+                    except Exception:
+                        pass
+
+                vm_key = _merge_cmp_value(vm_cmp)
+                vt_key = _merge_cmp_value(vt_cmp)
+                vb_key = _merge_cmp_value(vb_cmp)
+                mine_changed = (vm_key != vb_key)
+                theirs_changed = (vt_key != vb_key)
+                if mine_changed and theirs_changed and vm_key != vt_key:
+                    conflicts.append((name, r, c, vm_cmp, vt_cmp))
+                    conflict_cells_by_sheet.setdefault(name, {}).setdefault(r, set()).add(c)
+
+    return conflicts, conflict_cells_by_sheet
+
+
 class SheetView:
     """TortoiseMerge-like side-by-side full-sheet viewer.
 
@@ -1087,6 +1336,10 @@ class SheetView:
         self._prefer_only_diff_when_ready = False
         self._diff_partial = False
         self._align_rows_enabled = True
+        self._force_sequence_align = False
+        # After user-triggered rescan/toggle, ignore late background cache apply for this sheet
+        # to avoid delayed stale overwrite (rows unexpectedly disappear a few seconds later).
+        self._suppress_bg_apply = False
         # Set to True once initial diff data has been computed (background or manual).
         # Prevents refresh(rescan=False) from triggering a full rescan on empty initial state.
         self._data_ready = False
@@ -1129,11 +1382,24 @@ class SheetView:
         )
         # Put on the right for a stable position
         self.only_diff_cb.pack(side="right", padx=(6, 0))
+        self.force_align_var = tk.IntVar(value=0)
+        self.force_align_cb = tk.Checkbutton(
+            bar,
+            text="强制行对齐(SM)",
+            variable=self.force_align_var,
+            onvalue=1,
+            offvalue=0,
+            command=self._toggle_force_align,
+            padx=6,
+        )
+        self.force_align_cb.pack(side="right", padx=(6, 0))
         if getattr(self.app, "merge_conflict_mode", False):
             try:
                 self.only_diff_var.set(1)
                 self.only_diff_cb.select()
                 self.only_diff_cb.configure(state="disabled")
+                self.force_align_var.set(0)
+                self.force_align_cb.configure(state="disabled")
             except Exception:
                 pass
         self.three_way_var = tk.IntVar(value=1 if getattr(self.app, "merge_mode", False) and getattr(self.app, "has_base", False) else 0)
@@ -1223,6 +1489,14 @@ class SheetView:
                 self.use_right_btn.configure(text="采用Theirs(B)")
             except Exception:
                 pass
+        elif getattr(self.app, "merge_mode", False) and getattr(self.app, "has_base", False):
+            try:
+                self.use_left_btn.configure(text="使用mine", command=lambda: self._copy_selected_row("MINE2A"))
+                if self.use_base_btn is not None:
+                    self.use_base_btn.configure(text="使用base")
+                self.use_right_btn.configure(text="使用theirs", command=lambda: self._copy_selected_row("B2A"))
+            except Exception:
+                pass
         # Keep at top-right (avoid misclick)
         self.use_right_btn.pack(side="right", padx=(6, 0))
         if self.use_base_btn is not None:
@@ -1230,7 +1504,7 @@ class SheetView:
         self.use_left_btn.pack(side="right")
         self.undo_btn.pack(side="right", padx=(6, 0))
 
-        ttk.Button(bar, text="刷新本Sheet", command=lambda: self.refresh(row_only=None, rescan=True)).pack(side="right", padx=(6, 0))
+        ttk.Button(bar, text="刷新本Sheet", command=self._manual_rescan).pack(side="right", padx=(6, 0))
         self._full_render = False
         self._load_all_btn = ttk.Button(bar, text="加载全部", command=self._load_all_rows)
         if _FAST_OPEN_ENABLED:
@@ -1246,20 +1520,31 @@ class SheetView:
         path_bar.grid_columnconfigure(2, weight=1)
 
         self._path_font = ("Segoe UI", 9, "bold")
-        label_a = self.app.file_a
-        label_base = getattr(self.app, "base_path", "") or ""
-        label_b = self.app.file_b
-        if getattr(self.app, "merge_conflict_mode", False):
-            label_a = f"临时合并预览(merged预览): {self.app.file_a}"
-            if label_base:
-                label_base = f"基础(base): {label_base}"
-            label_b = f"对方(theirs): {self.app.file_b}"
+
+        def _one_line_text(s: str, max_len: int = 120) -> str:
+            s = (s or "").replace("\r", " ").replace("\n", " ")
+            if len(s) <= max_len:
+                return s
+            # keep file tail visible when path is long
+            return "..." + s[-(max_len - 3):]
+
+        if getattr(self.app, "merge_mode", False) and getattr(self.app, "has_base", False):
+            mine_src = getattr(self.app, "raw_mine", None) or self.app.file_a
+            base_src = getattr(self.app, "raw_base", None) or getattr(self.app, "base_path", "")
+            theirs_src = getattr(self.app, "raw_theirs", None) or self.app.file_b
+            label_a = f"mine={_one_line_text(mine_src)}"
+            label_base = f"base={_one_line_text(base_src)}" if base_src else "base=-"
+            label_b = f"theirs={_one_line_text(theirs_src)}"
+        else:
+            label_a = _one_line_text(self.app.file_a)
+            label_base = _one_line_text(getattr(self.app, "base_path", "") or "")
+            label_b = _one_line_text(self.app.file_b)
         self.path_label_a = tk.Label(
             path_bar,
             text=label_a,
             font=self._path_font,
-            bg="#eaf2ff",
-            anchor="center",
+            bg=_MINE_BG,
+            anchor="w",
             padx=6,
             pady=2,
         )
@@ -1268,8 +1553,8 @@ class SheetView:
             path_bar,
             text=label_base if label_base else "基础(base): -",
             font=self._path_font,
-            bg="#f3f3ff",
-            anchor="center",
+            bg=_BASE_BG,
+            anchor="w",
             padx=6,
             pady=2,
         )
@@ -1278,8 +1563,8 @@ class SheetView:
             path_bar,
             text=label_b,
             font=self._path_font,
-            bg="#ffecec",
-            anchor="center",
+            bg=_THEIRS_BG,
+            anchor="w",
             padx=6,
             pady=2,
         )
@@ -1323,15 +1608,18 @@ class SheetView:
         self._main_paned.bind("<ButtonRelease-1>", self._keep_panes_equal)
         self.frame.after(0, self._keep_panes_equal)
 
-        ttk.Label(left_wrap, text="A(左)", background="#eaf2ff").pack(fill="x")
-        ttk.Label(mid_wrap, text="Base(中)", background="#f3f3ff").pack(fill="x")
-        ttk.Label(right_wrap, text="B(右)", background="#ffecec").pack(fill="x")
+        self.left_title = ttk.Label(left_wrap, text="A(左)", background=_MINE_BG)
+        self.left_title.pack(fill="x")
+        self.mid_title = ttk.Label(mid_wrap, text="Base(中)", background=_BASE_BG)
+        self.mid_title.pack(fill="x")
+        self.right_title = ttk.Label(right_wrap, text="B(右)", background=_THEIRS_BG)
+        self.right_title.pack(fill="x")
 
         # Font size tuned closer to TortoiseMerge (+~20%)
         self.editor_font = ("Consolas", 11)
-        self.left = tk.Text(left_wrap, wrap="none", undo=False, font=self.editor_font)
-        self.base = tk.Text(mid_wrap, wrap="none", undo=False, font=self.editor_font)
-        self.right = tk.Text(right_wrap, wrap="none", undo=False, font=self.editor_font)
+        self.left = tk.Text(left_wrap, wrap="none", undo=False, font=self.editor_font, bg=_MINE_BG)
+        self.base = tk.Text(mid_wrap, wrap="none", undo=False, font=self.editor_font, bg=_BASE_BG)
+        self.right = tk.Text(right_wrap, wrap="none", undo=False, font=self.editor_font, bg=_THEIRS_BG)
 
         # Scrollbars
         # Per-pane vertical scrollbars (user requested visible scrollbars on both A and B)
@@ -1476,6 +1764,7 @@ class SheetView:
 
         # Save action row: keep a fixed height on both sides so horizontal
         # scrollbars stay aligned even when only one side has a button.
+        # Also keep middle pane height identical to left/right to avoid row misalignment.
         save_row_height = 34
 
         # Save A button (bottom-right of A pane)
@@ -1490,6 +1779,11 @@ class SheetView:
                 tk.Button(save_a_row, text="保存A", bg="#eaf2ff", padx=14, pady=4,
                           command=self.app.save_a_inplace).pack(side="right")
 
+        # Base pane spacer: maintain same bottom reserved height as A/B panes.
+        save_mid_row = ttk.Frame(mid_wrap, height=save_row_height)
+        save_mid_row.pack(fill="x", pady=(2, 0))
+        save_mid_row.pack_propagate(False)
+
         self.right.pack(fill="both", expand=True)
         self.hsb_right.pack(fill="x")
 
@@ -1503,14 +1797,14 @@ class SheetView:
 
         # Tags (order matters: diffcell should be applied after diffrow)
         # Closer to TortoiseMerge vibe: left diff block = orange, right diff block = yellow
-        self.left.tag_configure("diffrow", background="#F6C16B")
-        self.base.tag_configure("diffrow", background="#E3E3FF")
-        self.right.tag_configure("diffrow", background="#FFF176")
+        self.left.tag_configure("diffrow", background=_MINE_BG)
+        self.base.tag_configure("diffrow", background=_BASE_BG)
+        self.right.tag_configure("diffrow", background=_THEIRS_BG)
 
         # Cell-level highlight (red) for exact diffs
-        self.left.tag_configure("diffcell", background="#FF2D2D")
-        self.base.tag_configure("diffcell", background="#FF2D2D")
-        self.right.tag_configure("diffcell", background="#FF2D2D")
+        self.left.tag_configure("diffcell", background=_DIFF_CELL_BG)
+        self.base.tag_configure("diffcell", background=_DIFF_CELL_BG)
+        self.right.tag_configure("diffcell", background=_DIFF_CELL_BG)
 
         # Alignment padding: grey slot for rows that exist only on the other side.
         # tag_raise ensures paddingrow background overrides diffrow on the empty slot.
@@ -1542,7 +1836,8 @@ class SheetView:
                 w.bind("<Control-p>", lambda e: (self._goto_prev_diff_block(), "break"))
 
         # Click handling (selection + arrow action)
-        self.left.bind("<Button-1>", lambda e: self._on_click_with_arrow(self.left, e, "A2B"))
+        left_click_dir = "MINE2A" if (getattr(self.app, "merge_mode", False) and getattr(self.app, "has_base", False)) else "A2B"
+        self.left.bind("<Button-1>", lambda e, d=left_click_dir: self._on_click_with_arrow(self.left, e, d))
         self.base.bind("<Button-1>", lambda e: self._on_click_with_arrow(self.base, e, "BASE2A"))
         self.right.bind("<Button-1>", lambda e: self._on_click_with_arrow(self.right, e, "B2A"))
         # Hover arrows for row merge
@@ -1552,7 +1847,7 @@ class SheetView:
         self._left_cursor_default = self.left.cget("cursor")
         self._mid_cursor_default = self.base.cget("cursor")
         self._right_cursor_default = self.right.cget("cursor")
-        self.left.bind("<Motion>", lambda e: self._on_hover(self.left, e, "A2B"))
+        self.left.bind("<Motion>", lambda e, d=left_click_dir: self._on_hover(self.left, e, d))
         self.base.bind("<Motion>", lambda e: self._on_hover(self.base, e, "BASE2A"))
         self.right.bind("<Motion>", lambda e: self._on_hover(self.right, e, "B2A"))
         self.left.bind("<Leave>", lambda e: self._clear_hover(self.left))
@@ -1560,12 +1855,9 @@ class SheetView:
         self.right.bind("<Leave>", lambda e: self._clear_hover(self.right))
 
         # Double-click merge (single cell)
-        self.left.bind("<Double-Button-1>", lambda e: self._copy_cell("A2B", e))
+        self.left.bind("<Double-Button-1>", lambda e, d=left_click_dir: self._copy_cell(d, e))
         self.base.bind("<Double-Button-1>", lambda e: self._copy_cell("BASE2A", e))
         self.right.bind("<Double-Button-1>", lambda e: self._copy_cell("B2A", e))
-
-        # Initial panel state
-        self._toggle_three_way_view(init_only=True)
 
         # Sync bar (append right-side data to the end of left-side)
         sync_bar = ttk.Frame(self.frame)
@@ -1593,16 +1885,24 @@ class SheetView:
         self.c_area = ttk.Notebook(self.frame)
         self.c_area.pack(fill="x", padx=8, pady=(0, 4))
 
-        # ---- C1: two-line row text (A on top, B bottom) ----
+        # ---- C1: compact row compare (2 lines in 2-way, 3 lines in 3-way) ----
         c_text_frame = ttk.Frame(self.c_area)
         self.c_area.add(c_text_frame, text="C区-行对比")
 
-        self.cursor_cmp = tk.Text(c_text_frame, height=2, wrap="none", font=self.editor_font, bd=1, relief="solid")
+        self.cursor_cmp = tk.Text(
+            c_text_frame,
+            height=3 if self._is_three_way_enabled() else 2,
+            wrap="none",
+            font=self.editor_font,
+            bd=1,
+            relief="solid",
+        )
         # Make base colors stronger (user feedback: previous too light)
-        self.cursor_cmp.tag_configure("a", background="#CFE3FF")
-        self.cursor_cmp.tag_configure("b", background="#FFD1D1")
+        self.cursor_cmp.tag_configure("a", background=_MINE_BG)
+        self.cursor_cmp.tag_configure("base", background=_BASE_BG)
+        self.cursor_cmp.tag_configure("b", background=_THEIRS_BG)
         # Diff cell highlight (match main panes)
-        self.cursor_cmp.tag_configure("diffcell", background="#FF2D2D")
+        self.cursor_cmp.tag_configure("diffcell", background=_DIFF_CELL_BG)
         self.cursor_cmp.pack(side="top", fill="x", expand=True)
 
         # Horizontal scrollbar for C区行对比
@@ -1633,9 +1933,9 @@ class SheetView:
         ).pack(side="left")
 
         self.cell_cmp_text = tk.Text(c_cell_frame, height=6, wrap="none", font=self.editor_font, bd=1, relief="solid")
-        self.cell_cmp_text.tag_configure("a", background="#CFE3FF")
-        self.cell_cmp_text.tag_configure("b", background="#FFD1D1")
-        self.cell_cmp_text.tag_configure("diffcell", background="#FF2D2D")
+        self.cell_cmp_text.tag_configure("a", background=_MINE_BG)
+        self.cell_cmp_text.tag_configure("b", background=_THEIRS_BG)
+        self.cell_cmp_text.tag_configure("diffcell", background=_DIFF_CELL_BG)
 
         self.cell_cmp_hsb = ttk.Scrollbar(c_cell_frame, orient="horizontal", command=self.cell_cmp_text.xview)
         self.cell_cmp_text.configure(xscrollcommand=self.cell_cmp_hsb.set)
@@ -1648,6 +1948,8 @@ class SheetView:
         # (Still create the UI widgets now.)
         # self.refresh(row_only=None, rescan=True)
         # self._update_cursor_lines()
+        # Initial panel state (must run after C区 widgets are created)
+        self._toggle_three_way_view(init_only=True)
 
     # ---------- Scrolling sync ----------
     def _is_three_way_enabled(self) -> bool:
@@ -1671,13 +1973,26 @@ class SheetView:
         try:
             if enabled:
                 self.path_label_base.grid()
+                if getattr(self.app, "merge_mode", False):
+                    self.left_title.configure(text="Mine")
+                    self.mid_title.configure(text="Base")
+                    self.right_title.configure(text="Theirs")
             else:
                 self.path_label_base.grid_remove()
+                if getattr(self.app, "merge_mode", False):
+                    self.left_title.configure(text="A(左)")
+                    self.right_title.configure(text="B(右)")
+                self.mid_title.configure(text="Base(中)")
+        except Exception:
+            pass
+        try:
+            self.cursor_cmp.configure(height=3 if enabled else 2)
         except Exception:
             pass
         if not init_only:
             try:
                 self.refresh(row_only=None, rescan=False)
+                self._update_cursor_lines()
             except Exception:
                 pass
         try:
@@ -1783,8 +2098,10 @@ class SheetView:
     def _row_for_side(pair, side: str) -> int | None:
         if not pair:
             return None
-        if side in ("A", "BASE"):
+        if side == "A":
             return pair[0]
+        if side == "BASE":
+            return pair[0] if pair[0] is not None else pair[1]
         return pair[1]
 
     def _select_from_widget(self, w: tk.Text, event):
@@ -1833,13 +2150,18 @@ class SheetView:
         r = self._row_for_side(pair, self._side_for_widget(w))
         pair_idx = self._pair_idx_for_line(line)
         cols = self.pair_diff_cols.get(pair_idx, set()) if pair_idx is not None else set()
-        if not cols:
+        allow_base_row_action = (
+            self._is_three_way_enabled()
+            and direction == "BASE2A"
+            and w is self.base
+        )
+        if (not cols) and (not allow_base_row_action):
             return
         if r is None:
             return
         rownum_len = len(str(r))
         if col <= rownum_len:
-            self._copy_selected_row(direction)
+            self._copy_selected_row(direction, row_header=True)
 
     def _on_hover(self, w: tk.Text, event, direction: str):
         try:
@@ -1856,7 +2178,12 @@ class SheetView:
         r = self._row_for_side(pair, self._side_for_widget(w))
         pair_idx = self._pair_idx_for_line(line)
         cols = self.pair_diff_cols.get(pair_idx, set()) if pair_idx is not None else set()
-        if not cols:
+        allow_base_row_action = (
+            self._is_three_way_enabled()
+            and direction == "BASE2A"
+            and w is self.base
+        )
+        if (not cols) and (not allow_base_row_action):
             self._clear_hover(w)
             return
         if r is None:
@@ -1961,15 +2288,112 @@ class SheetView:
             t.tag_add("selrow", f"{line}.0", f"{line}.end")
         self._last_selected_line = line
 
-    def _update_cursor_lines(self):
-        """Update per-sheet compact A/B compare block (2 lines).
+    def _capture_view_anchor(self):
+        """Capture viewport and selection to restore after heavy refresh."""
+        first = 0.0
+        line = 1
+        pair_idx = self.selected_pair_idx
+        row_a = self.selected_excel_row_a
+        row_b = self.selected_excel_row_b
+        try:
+            first = float((self.left.yview() or (0.0, 1.0))[0])
+        except Exception:
+            first = 0.0
+        try:
+            line = int(str(self.left.index("insert")).split(".")[0])
+        except Exception:
+            line = 1
+        return (first, line, pair_idx, row_a, row_b)
 
-        - Line 1 is A, line 2 is B
-        - Highlight differing cells with background color matching the main panes
+    def _restore_view_anchor(self, anchor):
+        if not anchor:
+            return
+        first, line, pair_idx, row_a, row_b = anchor
+        try:
+            self.left.yview_moveto(first)
+            if self._is_three_way_enabled():
+                self.base.yview_moveto(first)
+            self.right.yview_moveto(first)
+        except Exception:
+            pass
+
+        target_line = None
+        # Prefer relocating by real excel row id; pair indices may shift after rescan.
+        try:
+            p = None
+            if row_a is not None:
+                p = self.row_a_to_pair_idx.get(row_a)
+            if p is None and row_b is not None:
+                p = self.row_b_to_pair_idx.get(row_b)
+            if p is not None and p in self.row_to_line:
+                target_line = self.row_to_line.get(p)
+        except Exception:
+            target_line = None
+        try:
+            if target_line is None and pair_idx is not None and pair_idx in self.row_to_line:
+                target_line = self.row_to_line.get(pair_idx)
+        except Exception:
+            target_line = None
+
+        if target_line is None:
+            try:
+                max_line = max(1, len(self.display_rows))
+            except Exception:
+                max_line = 1
+            target_line = max(1, min(int(line or 1), max_line))
+
+        idx = f"{target_line}.0"
+        for w in (self.left, self.base, self.right):
+            try:
+                w.mark_set("insert", idx)
+            except Exception:
+                pass
+        try:
+            self._highlight_selected_line(target_line)
+            self.selected_pair_idx = self._pair_idx_for_line(target_line)
+            pair = self._pair_for_line(target_line)
+            self.selected_excel_row_a = self._row_for_side(pair, "A")
+            self.selected_excel_row_b = self._row_for_side(pair, "B")
+            self.selected_excel_row = self.selected_excel_row_a or self.selected_excel_row_b
+        except Exception:
+            pass
+
+    def _base_to_mine_diff_cols(self, row_a: int | None, row_b: int | None, max_col: int) -> set[int]:
+        """Columns that differ between base and mine for the target row in 3-way mode."""
+        cols: set[int] = set()
+        if not self._is_three_way_enabled():
+            return cols
+        if not getattr(self.app, "has_base", False):
+            return cols
+        r = row_a if row_a is not None else row_b
+        if r is None:
+            return cols
+        try:
+            ws_a = self.app.ws_a_val(self.sheet)
+            ws_base = self.app.ws_base_val(self.sheet)
+        except Exception:
+            return cols
+        for c in range(1, max_col + 1):
+            try:
+                va = ws_a.cell(row=r, column=c).value
+                vb = ws_base.cell(row=r, column=c).value
+            except Exception:
+                va = None
+                vb = None
+            if _val_to_str(va) != _val_to_str(vb):
+                cols.add(c)
+        return cols
+
+    def _update_cursor_lines(self):
+        """Update compact row compare block.
+
+        2-way: line1=mine(A), line2=theirs(B)
+        3-way: line1=mine, line2=base, line3=theirs
         """
         try:
             la = int(self.left.index("insert").split(".")[0])
             lb = int(self.right.index("insert").split(".")[0])
+            lm = int(self.base.index("insert").split(".")[0])
 
             a_text = self.left.get(f"{la}.0", f"{la}.end") if la >= 1 else ""
             b_text = self.right.get(f"{lb}.0", f"{lb}.end") if lb >= 1 else ""
@@ -1978,30 +2402,48 @@ class SheetView:
             pair_idx = self._pair_idx_for_line(la)
             pair = self.row_pairs[pair_idx] if pair_idx is not None and pair_idx < len(self.row_pairs) else None
             diff_cols = self.pair_diff_cols.get(pair_idx, set()) if pair_idx is not None else set()
+            base_text = self.base.get(f"{lm}.0", f"{lm}.end") if lm >= 1 else ""
+            if self._is_three_way_enabled() and pair_idx is not None:
+                base_text = self._build_base_line(pair_idx)
 
-            # Force a strict 2-line rendering: line1=A, line2=B
+            is_three = self._is_three_way_enabled()
+            # Force strict rendering order:
+            # 2-way: mine/theirs
+            # 3-way: mine/base/theirs
             self.cursor_cmp.configure(state="normal")
             self.cursor_cmp.delete("1.0", "end")
-            self.cursor_cmp.insert("1.0", f"{a_text}\n{b_text}")
+            if is_three:
+                self.cursor_cmp.insert("1.0", f"{a_text}\n{base_text}\n{b_text}")
+            else:
+                self.cursor_cmp.insert("1.0", f"{a_text}\n{b_text}")
 
             # Clear & apply base tags
             self.cursor_cmp.tag_remove("a", "1.0", "end")
+            self.cursor_cmp.tag_remove("base", "1.0", "end")
             self.cursor_cmp.tag_remove("b", "1.0", "end")
             self.cursor_cmp.tag_remove("diffcell", "1.0", "end")
             self.cursor_cmp.tag_add("a", "1.0", "1.end")
-            self.cursor_cmp.tag_add("b", "2.0", "2.end")
+            if is_three:
+                self.cursor_cmp.tag_add("base", "2.0", "2.end")
+                self.cursor_cmp.tag_add("b", "3.0", "3.end")
+            else:
+                self.cursor_cmp.tag_add("b", "2.0", "2.end")
 
             # Cell-level diff highlight
             if diff_cols:
                 spans_a = self._spans_for_line(a_text)
                 spans_b = self._spans_for_line(b_text)
+                spans_base = self._spans_for_line(base_text) if is_three else {}
                 for c in diff_cols:
                     if c in spans_a:
                         s, e = spans_a[c]
                         self.cursor_cmp.tag_add("diffcell", f"1.{s}", f"1.{e}")
+                    if is_three and c in spans_base:
+                        s, e = spans_base[c]
+                        self.cursor_cmp.tag_add("diffcell", f"2.{s}", f"2.{e}")
                     if c in spans_b:
                         s, e = spans_b[c]
-                        self.cursor_cmp.tag_add("diffcell", f"2.{s}", f"2.{e}")
+                        self.cursor_cmp.tag_add("diffcell", f"{3 if is_three else 2}.{s}", f"{3 if is_three else 2}.{e}")
 
             self.cursor_cmp.configure(state="disabled")
 
@@ -2205,13 +2647,16 @@ class SheetView:
         line_b = self._row_label(rb) + "\t" + "\t".join(parts_b)
         return line_a, line_b, cols
 
-    def _build_row_pairs(self, ws_a_val, ws_b_val):
+    def _build_row_pairs(self, ws_a_val, ws_b_val, force: bool = False):
         # Align rows between A and B to avoid cascading diffs on insert/delete.
         max_row_a = ws_a_val.max_row or 1
         max_row_b = ws_b_val.max_row or 1
         max_row = max(max_row_a, max_row_b)
         if max_row <= 0:
             return []
+        if (not force) and max_row >= _ROW_ALIGN_MAX_ROWS:
+            # Large-sheet fast path: skip SequenceMatcher and pair rows directly.
+            return self._build_row_pairs_direct(max_row_a, max_row_b)
 
         def _row_sig_list(ws, max_row_local: int):
             # Read all rows in one pass (much faster than per-row iter_rows calls)
@@ -2387,11 +2832,22 @@ class SheetView:
         except Exception:
             pass
 
-        cur = int(self.only_diff_var.get())
+        raw_cur = int(self.only_diff_var.get())
+        cur = raw_cur
+        # Some environments occasionally fire command without committing IntVar change.
+        # If state didn't change, force flip once to keep UI and render mode consistent.
+        if cur == self._last_only_diff_value:
+            cur = 0 if self._last_only_diff_value else 1
+            self.only_diff_var.set(cur)
+            try:
+                _dlog(f"TOGGLE corrected stale state: raw={raw_cur} -> cur={cur} sheet={self.sheet}")
+            except Exception:
+                pass
         self._last_only_diff_value = cur
 
         # User-requested behavior: whenever only-diff state changes,
         # run the same refresh path as "刷新本Sheet" for deterministic UI update.
+        self._suppress_bg_apply = True
         self.refresh(row_only=None, rescan=True)
         self._update_cursor_lines()
         self._update_diff_nav_state()
@@ -2408,6 +2864,18 @@ class SheetView:
         except Exception as e:
             _dlog(f"settings debounce failed: {e}")
 
+    def _toggle_force_align(self):
+        """Manual override for large-sheet row pairing accuracy."""
+        try:
+            self._force_sequence_align = bool(self.force_align_var.get())
+            _dlog(f"TOGGLE force_align={self._force_sequence_align} sheet={self.sheet}")
+        except Exception:
+            self._force_sequence_align = bool(self.force_align_var.get())
+        self._suppress_bg_apply = True
+        self.refresh(row_only=None, rescan=True)
+        self._update_cursor_lines()
+        self._update_diff_nav_state()
+
     def _flush_settings(self):
         """Debounced settings write: called 1 s after the last only-diff toggle."""
         try:
@@ -2417,10 +2885,17 @@ class SheetView:
         except Exception as e:
             _dlog(f"settings save failed: {e}")
 
+    def _manual_rescan(self):
+        self._suppress_bg_apply = True
+        self.refresh(row_only=None, rescan=True)
+
     # ---------- Merge operations ----------
     def _copy_cell(self, direction: str, event):
         try:
+            anchor = self._capture_view_anchor()
             if direction == "A2B":
+                src = self.left
+            elif direction == "MINE2A":
                 src = self.left
             elif direction == "BASE2A":
                 src = self.base
@@ -2441,16 +2916,21 @@ class SheetView:
                     return
                 src_r = ra
                 dst_r = rb
-            elif direction == "BASE2A":
-                if ra is None:
+            elif direction == "MINE2A":
+                if ra is None and rb is None:
                     return
-                src_r = ra
-                dst_r = ra
+                src_r = ra if ra is not None else rb
+                dst_r = ra if ra is not None else rb
+            elif direction == "BASE2A":
+                if ra is None and rb is None:
+                    return
+                src_r = ra if ra is not None else rb
+                dst_r = ra if ra is not None else rb
             else:
-                if ra is None or rb is None:
+                if rb is None:
                     return
                 src_r = rb
-                dst_r = ra
+                dst_r = ra if ra is not None else rb
 
             line_text = src.get(f"{line}.0", f"{line}.end")
             before = line_text[:col_char]
@@ -2458,7 +2938,7 @@ class SheetView:
             # Clicking row header/arrow area should apply whole-row overwrite,
             # not a single-cell copy of the first column.
             if tab_count <= 0:
-                self._copy_selected_row(direction)
+                self._copy_selected_row(direction, row_header=True)
                 return
             c = max(1, tab_count)  # 1..N
             if c > self.max_col:
@@ -2484,6 +2964,12 @@ class SheetView:
                 self.app.modified_b = True
                 self.app.modified_sheets_b.add(self.sheet)
                 self.app.push_undo({"sheet": self.sheet, "target": "B", "cells": [(dst_r, c, old_edit, old_val)]})
+            elif direction == "MINE2A":
+                # Keep mine value; in conflict mode this means "accept mine".
+                if getattr(self.app, "merge_conflict_mode", False):
+                    self.app.user_touched_conflicts = True
+                    self._resolve_conflict_cell(dst_r, c)
+                return
             elif direction == "B2A":
                 old_edit = self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c).value
                 old_val = self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value
@@ -2517,20 +3003,20 @@ class SheetView:
                 self.touched_rows.add(touched_r)
             self._invalidate_render_cache()
 
-            # Recompute this row immediately, then do a full rescan in row-align mode
-            # so pair alignment and full-sheet diff state stay up-to-date.
+            # Minimize flicker: use row-only incremental refresh after overwrite.
+            # Full-sheet rescan can be done manually by user when needed.
             if bool(self.only_diff_var.get()) and self.snapshot_only_diff:
                 self._recalc_row_diff_and_update(dst_r)
             self.refresh(row_only=dst_r, rescan=False)
-            if self._align_rows_enabled:
-                self.refresh(row_only=None, rescan=True)
+            self._restore_view_anchor(anchor)
             self._update_cursor_lines()
         except Exception as e:
             messagebox.showerror("Error", f"覆盖单元格失败：\n{e}")
 
-    def _copy_selected_row(self, direction: str):
+    def _copy_selected_row(self, direction: str, row_header: bool = False):
         t0 = datetime.now()
         try:
+            anchor = self._capture_view_anchor()
             resolved_only = False
             # use last selected excel row (set on click); fallback to cursor line
             pair_idx = self.selected_pair_idx
@@ -2557,16 +3043,21 @@ class SheetView:
                     return
                 src_r = ra
                 dst_r = rb
-            elif direction == "BASE2A":
-                if ra is None:
+            elif direction == "MINE2A":
+                if ra is None and rb is None:
                     return
-                src_r = ra
-                dst_r = ra
+                src_r = ra if ra is not None else rb
+                dst_r = ra if ra is not None else rb
+            elif direction == "BASE2A":
+                if ra is None and rb is None:
+                    return
+                src_r = ra if ra is not None else rb
+                dst_r = ra if ra is not None else rb
             else:
-                if ra is None or rb is None:
+                if rb is None:
                     return
                 src_r = rb
-                dst_r = ra
+                dst_r = ra if ra is not None else rb
             ws_a_val = self.app.ws_a_val(self.sheet)
             ws_b_val = self.app.ws_b_val(self.sheet)
             ws_base_val = self.app.ws_base_val(self.sheet) if getattr(self.app, "has_base", False) else None
@@ -2574,8 +3065,7 @@ class SheetView:
             ws_b_edit = self.app.ws_b_edit(self.sheet)
             ws_base_edit = self.app.ws_base_edit(self.sheet) if getattr(self.app, "has_base", False) else None
 
-            # Row action should overwrite the full row range (not only diff cols),
-            # so "使用左侧/使用右侧" behaves as full-row adopt.
+            # Default row action overwrites full row range.
             full_max_col = max(
                 self.max_col,
                 ws_a_val.max_column or 1,
@@ -2585,7 +3075,37 @@ class SheetView:
                 ws_b_edit.max_column or 1,
                 (ws_base_edit.max_column or 1) if ws_base_edit is not None else 1,
             )
+            action_direction = direction
             cols = set(range(1, full_max_col + 1))
+
+            # 3-way row-header behavior:
+            # - Base row number: apply only diff cells to mine
+            # - Theirs row number: apply full row to mine
+            if row_header and self._is_three_way_enabled() and direction == "BASE2A":
+                # Use base-vs-mine diffs for base-row action (not mine-vs-theirs).
+                cols = self._base_to_mine_diff_cols(ra, rb, full_max_col)
+
+            # Recompute src/dst based on final action direction.
+            if action_direction == "A2B":
+                if ra is None or rb is None:
+                    return
+                src_r = ra
+                dst_r = rb
+            elif action_direction == "MINE2A":
+                if ra is None and rb is None:
+                    return
+                src_r = ra if ra is not None else rb
+                dst_r = ra if ra is not None else rb
+            elif action_direction == "BASE2A":
+                if ra is None and rb is None:
+                    return
+                src_r = ra if ra is not None else rb
+                dst_r = ra if ra is not None else rb
+            else:
+                if rb is None:
+                    return
+                src_r = rb
+                dst_r = ra if ra is not None else rb
 
             # Merge conflict mode:
             # - "A2B" means keep mine, just mark resolved.
@@ -2594,8 +3114,12 @@ class SheetView:
                 rows = self.app.merge_conflict_cells_by_sheet.get(self.sheet) if getattr(self.app, "merge_conflict_cells_by_sheet", None) else None
                 conflict_row = ra or rb
                 if rows and conflict_row in rows:
-                    cols = set(rows.get(conflict_row, set())) if direction == "A2B" else cols
-                if direction == "A2B":
+                    cols = set(rows.get(conflict_row, set())) if action_direction == "A2B" else cols
+                if action_direction == "A2B":
+                    self.app.user_touched_conflicts = True
+                    self._resolve_conflict_row(conflict_row, cols)
+                    resolved_only = True
+                elif action_direction == "MINE2A":
                     self.app.user_touched_conflicts = True
                     self._resolve_conflict_row(conflict_row, cols)
                     resolved_only = True
@@ -2603,7 +3127,7 @@ class SheetView:
             if not cols:
                 return
 
-            if direction == "A2B":
+            if action_direction == "A2B":
                 if not resolved_only:
                     undo_cells = []
                     for c in cols:
@@ -2618,7 +3142,10 @@ class SheetView:
                     self.app.modified_sheets_b.add(self.sheet)
                     if undo_cells:
                         self.app.push_undo({"sheet": self.sheet, "target": "B", "cells": undo_cells})
-            elif direction == "B2A":
+            elif action_direction == "MINE2A":
+                # Keep mine row as-is.
+                return
+            elif action_direction == "B2A":
                 undo_cells = []
                 for c in cols:
                     old_edit = ws_a_edit.cell(row=dst_r, column=c).value
@@ -2664,13 +3191,12 @@ class SheetView:
                 self.touched_rows.add(touched_r)
             self._invalidate_render_cache()
 
-            # Recompute this row immediately, then do a full rescan in row-align mode
-            # so pair alignment and full-sheet diff state stay up-to-date.
+            # Minimize flicker: use row-only incremental refresh after overwrite.
+            # Full-sheet rescan can be done manually by user when needed.
             if bool(self.only_diff_var.get()) and self.snapshot_only_diff:
                 self._recalc_row_diff_and_update(dst_r)
             self.refresh(row_only=dst_r, rescan=False)
-            if self._align_rows_enabled:
-                self.refresh(row_only=None, rescan=True)
+            self._restore_view_anchor(anchor)
             self._update_cursor_lines()
         except Exception as e:
             messagebox.showerror("Error", f"覆盖整行失败：\n{e}")
@@ -3137,14 +3663,16 @@ class SheetView:
                 max_row_a = ws_a.max_row or 1
                 max_row_b = ws_b.max_row or 1
 
-                # Very large sheets: skip expensive row-alignment on open.
-                if self.max_row >= _LARGE_SHEET_DIRECT_PAIR_THRESHOLD:
+                force_align = bool(getattr(self, "_force_sequence_align", False))
+
+                # Large sheets: skip expensive row-alignment on open unless user forces SM.
+                if (self.max_row >= _ROW_ALIGN_MAX_ROWS) and (not force_align):
                     self._align_rows_enabled = False
                     self.row_pairs = self._build_row_pairs_direct(max_row_a, max_row_b)
                 else:
                     self._align_rows_enabled = (not getattr(self.app, "merge_conflict_mode", False))
                     if self._align_rows_enabled:
-                        self.row_pairs = self._build_row_pairs(ws_a, ws_b)
+                        self.row_pairs = self._build_row_pairs(ws_a, ws_b, force=force_align)
                     else:
                         self.row_pairs = self._build_row_pairs_direct(max_row_a, max_row_b)
 
@@ -3509,17 +4037,27 @@ class SheetView:
 class SowMergeApp:
     def __init__(self, file_a: str, file_b: str, merge_mode: bool = False, merged_path: str | None = None,
                  base_path: str | None = None,
-                 merge_conflict_cells_by_sheet: dict | None = None, merge_conflict_mode: bool = False):
+                 merge_conflict_cells_by_sheet: dict | None = None, merge_conflict_mode: bool = False,
+                 raw_base: str | None = None, raw_mine: str | None = None, raw_theirs: str | None = None):
         self.file_a = file_a
         self.file_b = file_b
         self.base_path = base_path
         self.has_base = bool(base_path and os.path.exists(base_path))
+        self.raw_base = raw_base
+        self.raw_mine = raw_mine
+        self.raw_theirs = raw_theirs
         self.merge_mode = merge_mode
         self.merged_path = merged_path
         self.merge_conflict_cells_by_sheet = merge_conflict_cells_by_sheet or {}
         self.merge_conflict_mode = merge_conflict_mode
+        self.initial_conflict_cell_count = sum(
+            len(cols)
+            for rows in self.merge_conflict_cells_by_sheet.values()
+            for cols in rows.values()
+        )
         self.user_touched_conflicts = False
         self.undo_stack = []
+        self._auto_recalc_started = False
         # reset debug log each run
         try:
             with open(_DEBUG_LOG_PATH, "w", encoding="utf-8") as f:
@@ -3621,6 +4159,7 @@ class SowMergeApp:
         self.root.geometry("1450x860")
 
         self._build_ui()
+        self._schedule_auto_recalc()
 
     def _ensure_edit_loaded(self):
         if self._wb_a_edit is not None and self._wb_b_edit is not None and (not self.has_base or self._wb_base_edit is not None):
@@ -3693,9 +4232,24 @@ class SowMergeApp:
 
         summary = f"同名Sheet: {len(self.common_sheets)}   仅A: {len(self.only_a)}   仅B: {len(self.only_b)}"
         ttk.Label(top, text=summary).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        if self.merge_mode and (self.raw_mine or self.raw_base or self.raw_theirs):
+            raw_line = (
+                f"SVN原始传参: mine={os.path.basename(self.raw_mine or '-')}"
+                f" | base={os.path.basename(self.raw_base or '-')}"
+                f" | theirs={os.path.basename(self.raw_theirs or '-')}"
+            )
+            ttk.Label(top, text=raw_line, foreground="#555").grid(row=3, column=0, columnspan=3, sticky="w", pady=(4, 0))
+            read_line = (
+                f"当前实际读取: left(A)={os.path.basename(self.file_a or '-')}"
+                f" | base={os.path.basename(self.base_path or '-')}"
+                f" | right(B)={os.path.basename(self.file_b or '-')}"
+            )
+            ttk.Label(top, text=read_line, foreground="#555").grid(row=4, column=0, columnspan=3, sticky="w", pady=(2, 0))
         ttk.Label(top, text=f"Build: {APP_BUILD_TAG}", foreground="#666").grid(row=0, column=3, sticky="ne", padx=(16, 0))
 
         ttk.Button(top, text="重算并刷新", command=self.recalc_and_refresh).grid(row=0, column=2, rowspan=2, sticky="ne", padx=(10, 0))
+        ttk.Button(top, text="导出诊断包", command=self.export_diagnostic_bundle).grid(row=0, column=4, rowspan=2, sticky="ne", padx=(10, 0))
+        ttk.Button(top, text="复制反馈信息", command=self.copy_feedback_info).grid(row=0, column=5, rowspan=2, sticky="ne", padx=(10, 0))
 
         ttk.Separator(self.root, orient="horizontal").pack(fill="x", padx=10, pady=(0, 6))
 
@@ -3827,7 +4381,7 @@ class SowMergeApp:
 
         def _compute_row_pairs_bg(ws_a, ws_b, max_row_a: int, max_row_b: int, max_col: int):
             """Compute row alignment pairs using difflib.SequenceMatcher (background-safe)."""
-            if max(max_row_a, max_row_b) >= _LARGE_SHEET_DIRECT_PAIR_THRESHOLD:
+            if max(max_row_a, max_row_b) >= _ROW_ALIGN_MAX_ROWS:
                 max_row = max(max_row_a, max_row_b)
                 pairs = []
                 for r in range(1, max_row + 1):
@@ -3984,9 +4538,27 @@ class SowMergeApp:
             if view is None:
                 self.refresh_sheet_nav()
                 return
+            if getattr(view, "_suppress_bg_apply", False):
+                _dlog(f"skip bg cache apply by user action: sheet={sheet}")
+                self.refresh_sheet_nav()
+                return
             # Skip if the user has made edits in this view; background data (from read-only copies)
             # would be stale relative to the user's in-memory changes.
             if getattr(view, "_data_ready", False) and view.touched_rows:
+                self.refresh_sheet_nav()
+                return
+            # Guard against late background cache downgrading an already rendered sheet to no-diff.
+            # This has been observed as a delayed "DiffRows -> 0 / rows disappear" regression.
+            try:
+                old_diff_count = sum(1 for _k, _v in (view.pair_diff_cols or {}).items() if _v)
+            except Exception:
+                old_diff_count = 0
+            try:
+                new_diff_count = sum(1 for _k, _v in (cache.get("pair_diff_cols", {}) or {}).items() if _v)
+            except Exception:
+                new_diff_count = 0
+            if getattr(view, "_data_ready", False) and old_diff_count > 0 and new_diff_count == 0:
+                _dlog(f"skip stale cache downgrade: sheet={sheet} old_diff={old_diff_count} new_diff={new_diff_count}")
                 self.refresh_sheet_nav()
                 return
             view.max_row = cache["max_row"]
@@ -4020,12 +4592,39 @@ class SowMergeApp:
                     view._full_render = False
                     view._render_limit = min(_LARGE_SHEET_INITIAL_ROWS, view.max_row)
                 view._prefer_only_diff_when_ready = False
-            view.refresh(row_only=None, rescan=False)
-            # Reset cursor to line 1 after full re-render so _update_cursor_lines
-            # shows row 1 instead of a stale/out-of-range position.
+            # Preserve viewport/cursor when background cache is applied; otherwise
+            # user operations (overwrite/resolve) appear to "jump to first row".
+            prev_first = 0.0
+            prev_insert = "1.0"
             try:
-                view.left.mark_set("insert", "1.0")
-                view.right.mark_set("insert", "1.0")
+                prev_first = float((view.left.yview() or (0.0, 1.0))[0])
+                prev_insert = view.left.index("insert")
+            except Exception:
+                pass
+            view.refresh(row_only=None, rescan=False)
+            try:
+                view.left.yview_moveto(prev_first)
+                if view._is_three_way_enabled():
+                    view.base.yview_moveto(prev_first)
+                view.right.yview_moveto(prev_first)
+            except Exception:
+                pass
+            try:
+                line = int(str(prev_insert).split(".")[0])
+            except Exception:
+                line = 1
+            try:
+                max_line = max(1, len(view.display_rows))
+            except Exception:
+                max_line = 1
+            if line < 1:
+                line = 1
+            if line > max_line:
+                line = max_line
+            try:
+                idx = f"{line}.0"
+                view.left.mark_set("insert", idx)
+                view.right.mark_set("insert", idx)
             except Exception:
                 pass
             view._update_cursor_lines()
@@ -4372,6 +4971,86 @@ class SowMergeApp:
         excel_to_text(self.file_b, right_txt, thick_sep_char="=")
         open_tortoise_merge(left_txt, right_txt, title=f"{APP_NAME}: {os.path.basename(self.file_a)}")
 
+    def export_diagnostic_bundle(self):
+        try:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            default_name = f"{APP_NAME}_diag_{APP_BUILD_TAG}_{ts}.zip"
+            desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+            initial_dir = desktop if os.path.isdir(desktop) else tempfile.gettempdir()
+            save_path = filedialog.asksaveasfilename(
+                title="导出诊断包",
+                defaultextension=".zip",
+                initialdir=initial_dir,
+                initialfile=default_name,
+                filetypes=[("Zip Archive", "*.zip")],
+            )
+            if not save_path:
+                return
+
+            notes = []
+            notes.append(f"app={APP_NAME}")
+            notes.append(f"version={APP_VERSION}")
+            notes.append(f"build={APP_BUILD_TAG}")
+            notes.append(f"time={datetime.now().isoformat(timespec='seconds')}")
+            notes.append(f"python={sys.version.splitlines()[0]}")
+            notes.append(f"platform={platform.platform()}")
+            notes.append(f"merge_mode={self.merge_mode}")
+            notes.append(f"merge_conflict_mode={self.merge_conflict_mode}")
+            notes.append(f"file_a={self.file_a}")
+            notes.append(f"file_b={self.file_b}")
+            notes.append(f"base_path={self.base_path}")
+            notes.append(f"raw_mine={self.raw_mine}")
+            notes.append(f"raw_base={self.raw_base}")
+            notes.append(f"raw_theirs={self.raw_theirs}")
+
+            with zipfile.ZipFile(save_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("diagnostic_summary.txt", "\n".join(notes) + "\n")
+                for p in (_DEBUG_LOG_PATH, _LAUNCH_TRACE_PATH, _SETTINGS_PATH):
+                    try:
+                        if p and os.path.exists(p):
+                            zf.write(p, arcname=os.path.basename(p))
+                    except Exception:
+                        pass
+
+            messagebox.showinfo("导出完成", f"诊断包已导出：\n{save_path}")
+        except Exception as e:
+            messagebox.showerror("导出失败", f"导出诊断包失败：\n{e}")
+
+    def copy_feedback_info(self):
+        try:
+            selected_sheet = "-"
+            try:
+                tab_id = self.nb.select()
+                if tab_id:
+                    selected_sheet = self.nb.tab(tab_id, "text")
+            except Exception:
+                selected_sheet = "-"
+
+            lines = [
+                f"app={APP_NAME}",
+                f"version={APP_VERSION}",
+                f"build={APP_BUILD_TAG}",
+                f"time={datetime.now().isoformat(timespec='seconds')}",
+                f"merge_mode={self.merge_mode}",
+                f"merge_conflict_mode={self.merge_conflict_mode}",
+                f"selected_sheet={selected_sheet}",
+                f"file_a={self.file_a}",
+                f"file_b={self.file_b}",
+                f"base_path={self.base_path}",
+                f"raw_mine={self.raw_mine}",
+                f"raw_base={self.raw_base}",
+                f"raw_theirs={self.raw_theirs}",
+                f"debug_log={_DEBUG_LOG_PATH}",
+                f"launch_trace={_LAUNCH_TRACE_PATH}",
+            ]
+            text = "\n".join(lines)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.root.update()
+            messagebox.showinfo("已复制", "反馈信息已复制到剪贴板。")
+        except Exception as e:
+            messagebox.showerror("复制失败", f"复制反馈信息失败：\n{e}")
+
     def recalc_and_refresh(self):
         # Manual: force Excel recalc to refresh cached values, then reload view.
         def _do_recalc():
@@ -4406,6 +5085,66 @@ class SowMergeApp:
             self._with_progress("重算中", "正在重算并刷新，请稍候...", _do_recalc)
         except Exception as e:
             messagebox.showerror("重算失败", f"重算失败：\n{e}")
+
+    def _schedule_auto_recalc(self):
+        if not (_AUTO_RECALC_ON_OPEN and _USE_CACHED_VALUES_ONLY):
+            return
+        if not getattr(self, "merge_mode", False):
+            return
+        if self._auto_recalc_started:
+            return
+        self._auto_recalc_started = True
+
+        def _worker():
+            try:
+                new_a = _recalc_and_prepare_val_path(self.file_a)
+                new_b = _recalc_and_prepare_val_path(self.file_b)
+                new_base = _recalc_and_prepare_val_path(self.base_path) if getattr(self, "has_base", False) else None
+            except Exception:
+                new_a = None
+                new_b = None
+                new_base = None
+
+            if not (new_a or new_b or new_base):
+                return
+
+            def _apply():
+                try:
+                    if new_a:
+                        self._file_a_val_path = new_a
+                        self._wb_a_val = load_workbook(new_a, data_only=True)
+                    if new_b:
+                        self._file_b_val_path = new_b
+                        self._wb_b_val = load_workbook(new_b, data_only=True)
+                    if new_base and getattr(self, "has_base", False):
+                        self._file_base_val_path = new_base
+                        self._wb_base_val = load_workbook(new_base, data_only=True)
+
+                    try:
+                        tab_id = self.nb.select()
+                        tab_text = self.nb.tab(tab_id, "text")
+                        view = self.sheet_views.get(tab_text)
+                        if view:
+                            view.refresh(row_only=None, rescan=True)
+                    except Exception:
+                        pass
+
+                    try:
+                        for s in self.common_sheets:
+                            self.set_sheet_has_diff(s, False, confirmed=False)
+                        self._compute_queue = [s for s in self.common_sheets if s not in self._compute_inflight]
+                        self._kick_worker()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    _dlog(f"auto recalc apply failed: {e}")
+
+            try:
+                self.root.after(0, _apply)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _with_progress(self, title: str, message: str, fn):
         dlg = tk.Toplevel(self.root)
@@ -4606,6 +5345,19 @@ class SowMergeApp:
             return
         self._ensure_edit_loaded()
         if not auto:
+            if self.merge_mode and self.initial_conflict_cell_count > 0:
+                unresolved = sum(
+                    len(cols)
+                    for rows in self.merge_conflict_cells_by_sheet.values()
+                    for cols in rows.values()
+                )
+                if not messagebox.askyesno(
+                    "确认冲突处理",
+                    f"三方扫描检测到 {self.initial_conflict_cell_count} 个冲突单元格。"
+                    f"\n当前仍标记 {unresolved} 个（手动模式下不会自动清零）。"
+                    "\n\n请确认你已完成需要处理的冲突数据。是否继续保存？",
+                ):
+                    return
             if not messagebox.askyesno("确认保存", f"将保存合并结果到：\n\n{self.merged_path}\n\n继续吗？"):
                 return
         try:
@@ -4712,6 +5464,12 @@ class SowMergeApp:
 
 def main():
     try:
+        try:
+            _trace_launch("=" * 72)
+            _trace_launch(f"cwd={os.getcwd()}")
+            _trace_launch(f"argv={repr(sys.argv)}")
+        except Exception:
+            pass
         # Log raw args early for troubleshooting (even if argparse fails)
         try:
             _dlog(f"argv: {' '.join(sys.argv[1:])}")
@@ -4720,23 +5478,38 @@ def main():
 
         def _parse_slash_args(argv):
             out = {}
-            for a in argv:
+            keys = ("path", "path2", "base", "mine", "theirs", "merged")
+            i = 0
+            n = len(argv)
+            while i < n:
+                a = argv[i]
                 la = a.lower()
-                if la.startswith("/path:"):
-                    out["path"] = a[6:]
-                elif la.startswith("/path2:"):
-                    out["path2"] = a[7:]
-                elif la.startswith("/base:"):
-                    out["base"] = a[6:]
-                elif la.startswith("/mine:"):
-                    out["mine"] = a[6:]
-                elif la.startswith("/theirs:"):
-                    out["theirs"] = a[8:]
-                elif la.startswith("/merged:"):
-                    out["merged"] = a[8:]
+                matched = False
+                for k in keys:
+                    p1 = f"/{k}:"
+                    p2 = f"/{k}="
+                    p3 = f"-{k}:"
+                    p4 = f"-{k}="
+                    p5 = f"/{k}"
+                    p6 = f"-{k}"
+                    if la.startswith(p1) or la.startswith(p2) or la.startswith(p3) or la.startswith(p4):
+                        out[k] = a.split(":", 1)[1] if ":" in a else a.split("=", 1)[1]
+                        matched = True
+                        break
+                    if la == p5 or la == p6:
+                        if i + 1 < n:
+                            out[k] = argv[i + 1]
+                            i += 1
+                        matched = True
+                        break
+                i += 1
             return out
 
         slash_args = _parse_slash_args(sys.argv[1:])
+        try:
+            _trace_launch(f"slash_args={repr(slash_args)}")
+        except Exception:
+            pass
 
         parser = argparse.ArgumentParser(add_help=True)
         parser.add_argument("file_a", nargs="?")
@@ -4749,6 +5522,10 @@ def main():
         parser.add_argument("--title")
         parser.add_argument("--textdiff", action="store_true", help="Only generate text files and open TortoiseMerge")
         args, unknown = parser.parse_known_args()
+        try:
+            _trace_launch(f"argparse={repr(vars(args))} unknown={repr(unknown)}")
+        except Exception:
+            pass
         if unknown:
             try:
                 _dlog(f"unknown args: {unknown}")
@@ -4768,15 +5545,53 @@ def main():
             args.file_a = slash_args.get("path")
         if not args.file_b and "path2" in slash_args:
             args.file_b = slash_args.get("path2")
+        # Fallback: some launchers pass paths as plain unknown tokens.
+        # Try extracting existing filesystem paths from unknown args.
+        if (not args.file_a) and unknown:
+            path_tokens = []
+            for u in unknown:
+                if not u:
+                    continue
+                su = str(u).strip().strip('"')
+                if not su or su.startswith("-") or su.startswith("/"):
+                    continue
+                try:
+                    if os.path.exists(su):
+                        path_tokens.append(su)
+                except Exception:
+                    pass
+            if path_tokens:
+                args.file_a = path_tokens[0]
+                if len(path_tokens) >= 2:
+                    args.file_b = path_tokens[1]
+        try:
+            _trace_launch(
+                "resolved args: "
+                + f"file_a={repr(args.file_a)} file_b={repr(args.file_b)} "
+                + f"base={repr(args.base)} mine={repr(args.mine)} "
+                + f"theirs={repr(args.theirs)} merged={repr(args.merged)}"
+            )
+        except Exception:
+            pass
 
-        # Map SVN-style args to our 2-pane viewer (diff mode)
-        if args.base and args.mine and not args.theirs:
+        # Map SVN-style args to our 2-pane viewer (diff mode) / merge mode.
+        if args.base and args.mine and args.theirs and args.merged:
+            # Full 3-way merge args are already provided; do not fall back to file picker.
+            a, b = None, None
+        elif args.base and args.mine and not args.theirs:
             a, b = args.base, args.mine
         elif args.file_a and args.file_b:
             a, b = args.file_a, args.file_b
         elif args.file_a and (not args.file_b) and (not args.base) and (not args.mine) and (not args.theirs):
             # Single file provided (e.g., from Explorer/TortoiseSVN). If it's a conflicted file, auto-merge it.
             conflict = _detect_svn_conflict_files(args.file_a)
+            if (not conflict) and args.file_a:
+                try:
+                    auto_target = _find_conflict_in_dir(os.path.dirname(os.path.abspath(args.file_a)))
+                    if auto_target:
+                        conflict = _detect_svn_conflict_files(auto_target)
+                except Exception:
+                    conflict = conflict
             if conflict:
                 args.base, args.mine, args.theirs, args.merged = conflict
                 args.force_ui = True
@@ -4811,32 +5626,66 @@ def main():
                 return
             a = args.file_a
 
+        raw_base_arg = args.base
+        raw_mine_arg = args.mine
+        raw_theirs_arg = args.theirs
+
         # Normalize SVN merge temp files (merge-left/right.r####) by exporting true revision.
+        # IMPORTANT:
+        # - base/theirs may legitimately be revision snapshots.
+        # - mine must stay as the working-copy side; do NOT rewrite mine to a revision export,
+        #   otherwise local edits can be replaced by an old revision file.
         if args.base:
-            args.base = _try_export_svn_revision_from_merge_temp(args.base)
-        if args.mine:
-            args.mine = _try_export_svn_revision_from_merge_temp(args.mine)
+            base_from_wc = None
+            try:
+                # Prefer WC BASE from the conflicted working-copy file.
+                if args.merged:
+                    base_from_wc = _try_export_svn_base_from_working_copy(args.merged)
+            except Exception:
+                base_from_wc = None
+            if base_from_wc:
+                try:
+                    _dlog(f"merge base selected from WC BASE: {base_from_wc}")
+                except Exception:
+                    pass
+                args.base = base_from_wc
+                try:
+                    mine_for_note = raw_mine_arg or args.mine or args.merged or "-"
+                    raw_base_arg = f"{mine_for_note}@BASE(.svn)"
+                except Exception:
+                    raw_base_arg = "BASE(.svn)"
+            else:
+                args.base = _try_export_svn_revision_from_merge_temp(args.base)
         if args.theirs:
-            args.theirs = _try_export_svn_revision_from_merge_temp(args.theirs)
+            # In merge mode, keep "theirs" exactly as passed by SVN/Tortoise wrapper.
+            # This avoids accidental re-export to another revision snapshot and ensures
+            # content matches the user-visible *.merge-right.r#### sidecar file.
+            if not (args.base and args.mine and args.merged):
+                try:
+                    args.theirs = _try_export_svn_revision_from_merge_temp(args.theirs)
+                except Exception:
+                    args.theirs = args.theirs
         if args.file_a:
             args.file_a = _try_export_svn_revision_from_merge_temp(args.file_a)
         if args.file_b:
             args.file_b = _try_export_svn_revision_from_merge_temp(args.file_b)
+        try:
+            _trace_launch(
+                "normalized args: "
+                + f"base={repr(args.base)} mine={repr(args.mine)} "
+                + f"theirs={repr(args.theirs)} merged={repr(args.merged)} "
+                + f"raw_base={repr(raw_base_arg)} raw_theirs={repr(raw_theirs_arg)}"
+            )
+        except Exception:
+            pass
 
-        # Merge mode: apply theirs onto mine, detect conflicts, save merged, then exit.
+        # Merge mode (manual 3-way): detect conflicts only; do NOT pre-merge before UI.
         if args.base and args.mine and args.theirs and args.merged:
             conflicts = []
-            preview_path = None
             conflict_map = {}
-            force_ui = bool(getattr(args, "force_ui", False))
-            if unknown and any(str(u).lower() in (":", "working", "base") for u in unknown):
-                force_ui = True
-            if not force_ui and _has_svn_conflict_artifacts(args.merged):
-                # SVN conflict state detected: force UI review even if auto-merge finds no conflicts.
-                force_ui = True
             try:
                 _dlog(f"merge args: base={args.base} mine={args.mine} theirs={args.theirs} merged={args.merged}")
-                _dlog(f"merge force_ui={force_ui} unknown={unknown}")
+                _dlog(f"merge manual mode unknown={unknown}")
             except Exception:
                 pass
             try:
@@ -4845,14 +5694,12 @@ def main():
                 args.mine = _ensure_xlsx_copy(args.mine)
                 args.theirs = _ensure_xlsx_copy(args.theirs)
                 try:
-                    _dlog("merge start: calling _merge_three_way")
+                    _dlog("merge start: calling _scan_three_way_conflicts (no pre-merge)")
                 except Exception:
                     pass
-                conflicts, preview_path, conflict_map = _merge_three_way(
-                    args.base, args.mine, args.theirs, args.merged, save_merged=(not force_ui)
-                )
+                conflicts, conflict_map = _scan_three_way_conflicts(args.base, args.mine, args.theirs)
                 try:
-                    _dlog(f"merge result: conflicts={len(conflicts)} preview={preview_path} conflict_sheets={len(conflict_map)}")
+                    _dlog(f"merge scan result: conflicts={len(conflicts)} conflict_sheets={len(conflict_map)}")
                 except Exception:
                     pass
             except Exception as e:
@@ -4867,55 +5714,41 @@ def main():
                 sys.exit(1)
 
             if conflicts:
-                # Open merge UI in conflict-only mode (mine vs theirs), with merged preview as A.
                 _show_conflict_popup(conflicts)
 
-                app = SowMergeApp(
-                    preview_path,
-                    args.theirs,
-                    merge_mode=True,
-                    merged_path=args.merged,
-                    base_path=args.base,
-                    merge_conflict_cells_by_sheet=conflict_map,
-                    merge_conflict_mode=True,
-                )
-                app.run()
-                sys.exit(1)
-
-            # No conflicts
-            if force_ui and (not preview_path):
-                try:
-                    preview_path = _ensure_xlsx_copy(args.mine)
-                    _dlog(f"force_ui: created preview from mine: {preview_path}")
-                except Exception:
-                    pass
-            if force_ui and preview_path:
                 try:
                     messagebox.showinfo(
-                        "Merge ok",
-                        f"未检测到冲突，但将进入确认界面（可检查后保存）：\n{args.merged}",
+                        "进入手动处理",
+                        f"检测到 {len(conflicts)} 个冲突单元格。\n将进入手动 3 视图处理界面。",
                     )
                 except Exception:
                     pass
-                app = SowMergeApp(
-                    preview_path,
-                    args.theirs,
-                    merge_mode=True,
-                    merged_path=args.merged,
-                    base_path=args.base,
-                    merge_conflict_cells_by_sheet={},
-                    merge_conflict_mode=False,
-                )
+            else:
                 try:
-                    _dlog("open UI: force_ui no-conflict")
+                    messagebox.showinfo(
+                        "进入手动处理",
+                        "未检测到直接冲突。\n仍将进入手动 3 视图，所有差异由你确认后保存。"
+                    )
                 except Exception:
                     pass
-                app.run()
-                sys.exit(0)
+
+            app = SowMergeApp(
+                args.mine,
+                args.theirs,
+                merge_mode=True,
+                merged_path=args.merged,
+                base_path=args.base,
+                merge_conflict_cells_by_sheet=conflict_map,
+                merge_conflict_mode=False,
+                raw_base=raw_base_arg,
+                raw_mine=raw_mine_arg,
+                raw_theirs=raw_theirs_arg,
+            )
             try:
-                messagebox.showinfo("Merge ok", f"合并完成，已保存：\n{args.merged}")
+                _dlog("open UI: manual 3-way mode")
             except Exception:
-                print(f"Merge ok: {args.merged}", file=sys.stderr)
+                pass
+            app.run()
             sys.exit(0)
 
         if args.textdiff:
