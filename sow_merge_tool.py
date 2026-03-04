@@ -26,7 +26,7 @@ from openpyxl.utils import get_column_letter
 
 APP_NAME = "sow_merge_tool"
 APP_VERSION = "2026-03-02.perf1"
-APP_BUILD_TAG = "new55-replace-similarity-align"
+APP_BUILD_TAG = "new56-visible-grid-overlay"
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
 _DEBUG_LOG_PATH = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_debug.log")
@@ -1393,6 +1393,17 @@ class SheetView:
             padx=6,
         )
         self.force_align_cb.pack(side="right", padx=(6, 0))
+        self.grid_overlay_var = tk.IntVar(value=1)
+        self.grid_overlay_cb = tk.Checkbutton(
+            bar,
+            text="网格显示",
+            variable=self.grid_overlay_var,
+            onvalue=1,
+            offvalue=0,
+            command=self._toggle_grid_overlay,
+            padx=6,
+        )
+        self.grid_overlay_cb.pack(side="right", padx=(6, 0))
         if getattr(self.app, "merge_conflict_mode", False):
             try:
                 self.only_diff_var.set(1)
@@ -2037,6 +2048,26 @@ class SheetView:
                 pass
         try:
             self.frame.after(0, self._keep_panes_equal)
+        except Exception:
+            pass
+
+    def _is_grid_overlay_enabled(self) -> bool:
+        try:
+            return bool(getattr(self, "grid_overlay_var", None) and self.grid_overlay_var.get())
+        except Exception:
+            return False
+
+    def _gridify_parts(self, parts: list[str]) -> list[str]:
+        if not self._is_grid_overlay_enabled():
+            return parts
+        # Keep tab layout unchanged; prepend a visual splitter in each cell.
+        return [f"|{p}" for p in parts]
+
+    def _toggle_grid_overlay(self):
+        try:
+            self._invalidate_render_cache()
+            self.refresh(row_only=None, rescan=False)
+            self._update_cursor_lines()
         except Exception:
             pass
 
@@ -2893,7 +2924,9 @@ class SheetView:
         return str(r) if r is not None else ""
 
     def _build_line_from_row_label(self, label: str, row_vals) -> str:
-        return label + "\t" + "\t".join(_val_to_str(v) for v in row_vals)
+        parts = [_val_to_str(v) for v in row_vals]
+        parts = self._gridify_parts(parts)
+        return label + "\t" + "\t".join(parts)
 
     def _build_row_and_diff_pair(self, ws_a_val, ws_b_val, ws_a_edit, ws_b_edit, ra: int | None, rb: int | None):
         parts_a = []
@@ -2905,6 +2938,8 @@ class SheetView:
             parts_b.append(_val_to_str(db))
             if not eq:
                 cols.add(c)
+        parts_a = self._gridify_parts(parts_a)
+        parts_b = self._gridify_parts(parts_b)
         line_a = self._row_label(ra) + "\t" + "\t".join(parts_a)
         line_b = self._row_label(rb) + "\t" + "\t".join(parts_b)
         return line_a, line_b, cols
@@ -3775,6 +3810,7 @@ class SheetView:
             except Exception:
                 v = None
             parts.append(_val_to_str(v))
+        parts = self._gridify_parts(parts)
         return str(r) + "\t" + "\t".join(parts)
 
     def _render_base_full(self):
