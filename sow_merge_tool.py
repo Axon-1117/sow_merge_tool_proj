@@ -26,7 +26,7 @@ from openpyxl.utils import get_column_letter
 
 APP_NAME = "sow_merge_tool"
 APP_VERSION = "2026-03-02.perf1"
-APP_BUILD_TAG = "new46-copy-feedback-info"
+APP_BUILD_TAG = "new55-replace-similarity-align"
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
 _DEBUG_LOG_PATH = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_debug.log")
@@ -1574,6 +1574,10 @@ class SheetView:
         # NOTE: must be packed BEFORE the paned window so it remains visible.
         self.vsb_left = ttk.Scrollbar(self.frame, orient="vertical", command=self._yview_both)
         self.vsb_left.pack(side="left", fill="y")
+        # Diff minimap next to the left vertical scrollbar (more discoverable).
+        self.vdiff_map = tk.Canvas(self.frame, width=10, highlightthickness=0, bg="#ebebeb")
+        self.vdiff_map.pack(side="left", fill="y", padx=(0, 2))
+        self.vdiff_map.bind("<Button-1>", self._on_vdiff_map_click)
 
         # Panes
         paned = ttk.PanedWindow(self.frame, orient="horizontal")
@@ -1630,9 +1634,8 @@ class SheetView:
         self.vsb_m.pack(side="right", fill="y")
         self.vsb_b.pack(side="right", fill="y")
 
-        # Shared vertical scrollbar on far right (keep)
-        self.vsb = ttk.Scrollbar(self.frame, orient="vertical", command=self._yview_both)
-        self.vsb.pack(side="right", fill="y")
+        # Shared vertical scrollbar on far right removed (redundant / low usability).
+        self.vsb = None
 
         # Horizontal scroll sync: keep A/B panes aligned when scrolling horizontally.
         self._xsyncing = False
@@ -1656,6 +1659,10 @@ class SheetView:
                     self.hsb_mid.set(mf, ml)
             finally:
                 self._xsyncing = False
+            try:
+                self._update_diff_maps()
+            except Exception:
+                pass
 
         def _xscroll_right(first, last):
             if self._xsyncing:
@@ -1674,6 +1681,10 @@ class SheetView:
                     self.hsb_mid.set(mf, ml)
             finally:
                 self._xsyncing = False
+            try:
+                self._update_diff_maps()
+            except Exception:
+                pass
 
         def _xscroll_mid(first, last):
             if self._xsyncing:
@@ -1690,6 +1701,10 @@ class SheetView:
                 self.hsb_right.set(rf, rl)
             finally:
                 self._xsyncing = False
+            try:
+                self._update_diff_maps()
+            except Exception:
+                pass
 
         def _xview_left(*args):
             # scrollbar drag/click on left
@@ -1708,6 +1723,10 @@ class SheetView:
                     self.hsb_mid.set(mf, ml)
             finally:
                 self._xsyncing = False
+            try:
+                self._update_diff_maps()
+            except Exception:
+                pass
 
         def _xview_right(*args):
             self._xsyncing = True
@@ -1725,6 +1744,10 @@ class SheetView:
                     self.hsb_mid.set(mf, ml)
             finally:
                 self._xsyncing = False
+            try:
+                self._update_diff_maps()
+            except Exception:
+                pass
 
         def _xview_mid(*args):
             self._xsyncing = True
@@ -1740,10 +1763,20 @@ class SheetView:
                 self.hsb_right.set(rf, rl)
             finally:
                 self._xsyncing = False
+            try:
+                self._update_diff_maps()
+            except Exception:
+                pass
 
         self.hsb_left = ttk.Scrollbar(left_wrap, orient="horizontal", command=_xview_left)
         self.hsb_mid = ttk.Scrollbar(mid_wrap, orient="horizontal", command=_xview_mid)
         self.hsb_right = ttk.Scrollbar(right_wrap, orient="horizontal", command=_xview_right)
+        self.hdiff_left = tk.Canvas(left_wrap, height=10, highlightthickness=0, bg="#ebebeb")
+        self.hdiff_mid = tk.Canvas(mid_wrap, height=10, highlightthickness=0, bg="#ebebeb")
+        self.hdiff_right = tk.Canvas(right_wrap, height=10, highlightthickness=0, bg="#ebebeb")
+        self.hdiff_left.bind("<Button-1>", lambda e: self._on_hdiff_map_click(e, "left"))
+        self.hdiff_mid.bind("<Button-1>", lambda e: self._on_hdiff_map_click(e, "mid"))
+        self.hdiff_right.bind("<Button-1>", lambda e: self._on_hdiff_map_click(e, "right"))
         self.left.configure(xscrollcommand=_xscroll_left)
         self.base.configure(xscrollcommand=_xscroll_mid)
         self.right.configure(xscrollcommand=_xscroll_right)
@@ -1751,7 +1784,6 @@ class SheetView:
         self.left.configure(yscrollcommand=self._yscroll_left)
         self.base.configure(yscrollcommand=self._yscroll_mid)
         self.right.configure(yscrollcommand=self._yscroll_right)
-        self.vsb.configure(command=self._yview_both)
         self.vsb_left.configure(command=self._yview_both)
         self.vsb_a.configure(command=self._yview_both)
         self.vsb_m.configure(command=self._yview_both)
@@ -1759,8 +1791,10 @@ class SheetView:
 
         self.left.pack(fill="both", expand=True)
         self.hsb_left.pack(fill="x")
+        self.hdiff_left.pack(fill="x")
         self.base.pack(fill="both", expand=True)
         self.hsb_mid.pack(fill="x")
+        self.hdiff_mid.pack(fill="x")
 
         # Save action row: keep a fixed height on both sides so horizontal
         # scrollbars stay aligned even when only one side has a button.
@@ -1786,6 +1820,7 @@ class SheetView:
 
         self.right.pack(fill="both", expand=True)
         self.hsb_right.pack(fill="x")
+        self.hdiff_right.pack(fill="x")
 
         # Save B button (bottom-right of B pane)
         save_b_row = ttk.Frame(right_wrap, height=save_row_height)
@@ -1805,6 +1840,10 @@ class SheetView:
         self.left.tag_configure("diffcell", background=_DIFF_CELL_BG)
         self.base.tag_configure("diffcell", background=_DIFF_CELL_BG)
         self.right.tag_configure("diffcell", background=_DIFF_CELL_BG)
+        # Row-number highlight for diff rows (helps locate changed columns on very long lines)
+        self.left.tag_configure("diffrownum", background=_DIFF_CELL_BG, foreground="#ffffff")
+        self.base.tag_configure("diffrownum", background=_DIFF_CELL_BG, foreground="#ffffff")
+        self.right.tag_configure("diffrownum", background=_DIFF_CELL_BG, foreground="#ffffff")
 
         # Alignment padding: grey slot for rows that exist only on the other side.
         # tag_raise ensures paddingrow background overrides diffrow on the empty slot.
@@ -1909,6 +1948,7 @@ class SheetView:
         self.cursor_hsb = ttk.Scrollbar(c_text_frame, orient="horizontal", command=self.cursor_cmp.xview)
         self.cursor_cmp.configure(xscrollcommand=self.cursor_hsb.set)
         self.cursor_hsb.pack(side="top", fill="x")
+        self.cursor_cmp.bind("<Double-Button-1>", self._on_cursor_cmp_double_click)
 
         # ---- C2: cell-aligned view (optional; can be hidden if not useful/performance) ----
         self._enable_c_cell = False  # user feedback: not useful; keep hidden by default
@@ -2001,11 +2041,15 @@ class SheetView:
             pass
 
     def _yscroll_all(self, first, last):
-        for sb in (self.vsb, self.vsb_left, self.vsb_a, self.vsb_m, self.vsb_b):
+        for sb in (self.vsb_left, self.vsb_a, self.vsb_m, self.vsb_b):
             try:
                 sb.set(first, last)
             except Exception:
                 pass
+        try:
+            self._update_diff_maps()
+        except Exception:
+            pass
 
     def _yscroll_left(self, first, last):
         if self._syncing:
@@ -2068,6 +2112,109 @@ class SheetView:
         self._yview_both("scroll", steps, "units")
         return "break"
 
+    def _on_vdiff_map_click(self, event):
+        try:
+            h = max(1, self.vdiff_map.winfo_height())
+            frac = min(1.0, max(0.0, float(event.y) / float(h)))
+            self._yview_both("moveto", frac)
+        except Exception:
+            pass
+
+    def _on_hdiff_map_click(self, event, pane: str):
+        try:
+            canvas = self.hdiff_left if pane == "left" else (self.hdiff_mid if pane == "mid" else self.hdiff_right)
+            w = max(1, canvas.winfo_width())
+            frac = min(1.0, max(0.0, float(event.x) / float(w)))
+            self.left.xview_moveto(frac)
+            if self._is_three_way_enabled():
+                self.base.xview_moveto(frac)
+            self.right.xview_moveto(frac)
+        except Exception:
+            pass
+
+    def _update_diff_maps(self):
+        # Vertical diff map (by display row index)
+        try:
+            self.vdiff_map.delete("all")
+            h = max(1, self.vdiff_map.winfo_height())
+            w = max(1, self.vdiff_map.winfo_width())
+            rows = self._full_display_rows if self._full_display_rows else self.display_rows
+            n = max(1, len(rows))
+            diff_mask = [bool(self.pair_diff_cols.get(pidx)) for pidx in rows]
+            diff_count = sum(1 for v in diff_mask if v)
+            # Dynamic marker height:
+            # - fewer diffs -> thicker marker for visibility
+            # - many diffs -> thinner marker to reduce overlap
+            marker_min_h = max(2, min(12, int(h / max(1, diff_count)))) if diff_count > 0 else 2
+
+            # Draw contiguous diff blocks as filled segments for better discoverability.
+            i = 0
+            while i < n:
+                if not diff_mask[i]:
+                    i += 1
+                    continue
+                j = i
+                while j + 1 < n and diff_mask[j + 1]:
+                    j += 1
+                y1 = int((i / n) * h)
+                y2 = int(((j + 1) / n) * h)
+                if y2 - y1 < marker_min_h:
+                    y2 = min(h, y1 + marker_min_h)
+                self.vdiff_map.create_rectangle(0, y1, w, y2, outline="", fill="#ff2d2d")
+                i = j + 1
+            try:
+                first, last = self.left.yview()
+                y1 = int(first * h)
+                y2 = max(y1 + 2, int(last * h))
+                self.vdiff_map.create_rectangle(0, y1, w, y2, outline="#1e78ff")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        # Horizontal diff maps (under each pane scrollbar; by diff columns)
+        try:
+            diff_cols = set()
+            for cols in (self.pair_diff_cols or {}).values():
+                if cols:
+                    diff_cols.update(cols)
+            max_col = max(1, int(self.max_col or 1))
+            canvases = [self.hdiff_left, self.hdiff_right]
+            if self._is_three_way_enabled():
+                canvases.insert(1, self.hdiff_mid)
+            for canvas in canvases:
+                canvas.delete("all")
+                cw = max(1, canvas.winfo_width())
+                ch = max(1, canvas.winfo_height())
+                if diff_cols:
+                    marker_min_w = max(2, min(14, int(cw / max(1, len(diff_cols)))))
+                    sorted_cols = sorted(diff_cols)
+                    seg_start = sorted_cols[0]
+                    seg_end = sorted_cols[0]
+                    for c in sorted_cols[1:]:
+                        if c == seg_end + 1:
+                            seg_end = c
+                        else:
+                            x1 = int(((seg_start - 1) / max_col) * cw)
+                            x2 = int((seg_end / max_col) * cw)
+                            if x2 - x1 < marker_min_w:
+                                x2 = min(cw, x1 + marker_min_w)
+                            canvas.create_rectangle(x1, 0, x2, ch, outline="", fill="#c46a00")
+                            seg_start = c
+                            seg_end = c
+                    x1 = int(((seg_start - 1) / max_col) * cw)
+                    x2 = int((seg_end / max_col) * cw)
+                    if x2 - x1 < marker_min_w:
+                        x2 = min(cw, x1 + marker_min_w)
+                    canvas.create_rectangle(x1, 0, x2, ch, outline="", fill="#c46a00")
+                try:
+                    lf, ll = self.left.xview()
+                    canvas.create_rectangle(int(lf * cw), 0, max(int(ll * cw), int(lf * cw) + 2), ch, outline="#1e78ff")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     # ---------- Selection + toolbar buttons ----------
     def _widget_line(self, w: tk.Text):
         try:
@@ -2101,7 +2248,9 @@ class SheetView:
         if side == "A":
             return pair[0]
         if side == "BASE":
-            return pair[0] if pair[0] is not None else pair[1]
+            # Base must map to its own aligned row identity (A-side index only).
+            # Falling back to B causes duplicated base row numbers in gap regions.
+            return pair[0]
         return pair[1]
 
     def _select_from_widget(self, w: tk.Text, event):
@@ -2522,6 +2671,119 @@ class SheetView:
         except Exception:
             pass
 
+    def _copy_single_cell_by_pair(self, pair_idx: int, direction: str, c: int):
+        try:
+            if pair_idx is None or pair_idx >= len(self.row_pairs):
+                return
+            pair = self.row_pairs[pair_idx]
+            ra = self._row_for_side(pair, "A")
+            rb = self._row_for_side(pair, "B")
+            if direction == "A2B":
+                if ra is None or rb is None:
+                    return
+                src_r, dst_r = ra, rb
+            elif direction == "BASE2A":
+                if ra is None:
+                    return
+                src_r = ra
+                dst_r = ra
+            else:
+                if rb is None:
+                    return
+                src_r = rb
+                dst_r = ra if ra is not None else rb
+
+            anchor = self._capture_view_anchor()
+            if direction == "A2B":
+                old_edit = self.app.ws_b_edit(self.sheet).cell(row=dst_r, column=c).value
+                old_val = self.app.ws_b_val(self.sheet).cell(row=dst_r, column=c).value
+                v_edit = self.app.ws_a_edit(self.sheet).cell(row=src_r, column=c).value
+                v_val = self.app.ws_a_val(self.sheet).cell(row=src_r, column=c).value
+                self.app.ws_b_edit(self.sheet).cell(row=dst_r, column=c).value = v_val if _USE_CACHED_VALUES_ONLY else v_edit
+                self.app.ws_b_val(self.sheet).cell(row=dst_r, column=c).value = v_val
+                self.app.modified_b = True
+                self.app.modified_sheets_b.add(self.sheet)
+                self.app.push_undo({"sheet": self.sheet, "target": "B", "cells": [(dst_r, c, old_edit, old_val)]})
+            elif direction == "BASE2A":
+                old_edit = self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c).value
+                old_val = self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value
+                v_edit = self.app.ws_base_edit(self.sheet).cell(row=src_r, column=c).value
+                v_val = self.app.ws_base_val(self.sheet).cell(row=src_r, column=c).value
+                self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c).value = v_val if _USE_CACHED_VALUES_ONLY else v_edit
+                self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value = v_val
+                self.app.modified_a = True
+                self.app.modified_sheets_a.add(self.sheet)
+                self.app.push_undo({"sheet": self.sheet, "target": "A", "cells": [(dst_r, c, old_edit, old_val)]})
+            else:
+                old_edit = self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c).value
+                old_val = self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value
+                v_edit = self.app.ws_b_edit(self.sheet).cell(row=src_r, column=c).value
+                v_val = self.app.ws_b_val(self.sheet).cell(row=src_r, column=c).value
+                self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c).value = v_val if _USE_CACHED_VALUES_ONLY else v_edit
+                self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value = v_val
+                self.app.modified_a = True
+                self.app.modified_sheets_a.add(self.sheet)
+                self.app.push_undo({"sheet": self.sheet, "target": "A", "cells": [(dst_r, c, old_edit, old_val)]})
+
+            touched_r = ra or rb
+            if touched_r is not None:
+                self.touched_rows.add(touched_r)
+            self._invalidate_render_cache()
+            if bool(self.only_diff_var.get()) and self.snapshot_only_diff:
+                self._recalc_row_diff_and_update(dst_r)
+            self.refresh(row_only=dst_r, rescan=False)
+            self._restore_view_anchor(anchor)
+            self._update_cursor_lines()
+        except Exception as e:
+            messagebox.showerror("Error", f"C区覆盖失败：\n{e}")
+
+    def _on_cursor_cmp_double_click(self, event):
+        try:
+            idx = self.cursor_cmp.index(f"@{event.x},{event.y}")
+            line_no = int(str(idx).split(".")[0])
+            char_no = int(str(idx).split(".")[1])
+        except Exception:
+            return
+
+        pair_idx = self.selected_pair_idx
+        if pair_idx is None:
+            try:
+                line = int(self.left.index("insert").split(".")[0])
+                pair_idx = self._pair_idx_for_line(line)
+            except Exception:
+                pair_idx = None
+        if pair_idx is None or pair_idx >= len(self.row_pairs):
+            return
+
+        diff_cols = set(self.pair_diff_cols.get(pair_idx, set()))
+        if not diff_cols:
+            return
+
+        is_three = self._is_three_way_enabled()
+        if is_three:
+            if line_no == 2:
+                direction = "BASE2A"
+            elif line_no == 3:
+                direction = "B2A"
+            else:
+                return
+        else:
+            if line_no == 2:
+                direction = "B2A"
+            else:
+                return
+
+        line_text = self.cursor_cmp.get(f"{line_no}.0", f"{line_no}.end")
+        spans = self._spans_for_line(line_text)
+        hit_col = None
+        for c, (s, e) in spans.items():
+            if s <= char_no <= e:
+                hit_col = c
+                break
+        if hit_col is None or hit_col not in diff_cols:
+            return
+        self._copy_single_cell_by_pair(pair_idx, direction, hit_col)
+
     def _update_merge_buttons_for_row(self, excel_row: int):
         # Buttons are always visible; no UI updates needed.
         return
@@ -2678,6 +2940,18 @@ class SheetView:
         sig_a = _row_sig_list(ws_a_val, max_row_a)
         sig_b = _row_sig_list(ws_b_val, max_row_b)
 
+        def _sim_score(sa: str, sb: str) -> float:
+            if sa == sb:
+                return 2.0
+            if (not sa) or (not sb):
+                return 0.0
+            # Non-exact similarity fallback for replace blocks:
+            # avoids mapping A[x] -> B[y] when B[z] is clearly closer.
+            try:
+                return difflib.SequenceMatcher(a=sa, b=sb, autojunk=False).ratio()
+            except Exception:
+                return 0.0
+
         sm = difflib.SequenceMatcher(a=sig_a, b=sig_b, autojunk=False)
         pairs: list[tuple[int | None, int | None]] = []
         for tag, i1, i2, j1, j2 in sm.get_opcodes():
@@ -2688,12 +2962,32 @@ class SheetView:
                 len_a = i2 - i1
                 len_b = j2 - j1
                 common = min(len_a, len_b)
+                # Choose head/tail mapping by similarity score (not only exact hits).
+                head_score = 0.0
+                tail_score = 0.0
                 for k in range(common):
-                    pairs.append((i1 + k + 1, j1 + k + 1))
-                for k in range(common, len_a):
-                    pairs.append((i1 + k + 1, None))
-                for k in range(common, len_b):
-                    pairs.append((None, j1 + k + 1))
+                    head_score += _sim_score(sig_a[i1 + k], sig_b[j1 + k])
+                    tail_score += _sim_score(sig_a[i2 - common + k], sig_b[j2 - common + k])
+                # Prefer tail on tie to better match append-heavy editing patterns.
+                use_tail = tail_score >= head_score
+                if use_tail:
+                    extra_a = len_a - common
+                    extra_b = len_b - common
+                    for k in range(extra_a):
+                        pairs.append((i1 + k + 1, None))
+                    for k in range(extra_b):
+                        pairs.append((None, j1 + k + 1))
+                    a_start = i2 - common
+                    b_start = j2 - common
+                    for k in range(common):
+                        pairs.append((a_start + k + 1, b_start + k + 1))
+                else:
+                    for k in range(common):
+                        pairs.append((i1 + k + 1, j1 + k + 1))
+                    for k in range(common, len_a):
+                        pairs.append((i1 + k + 1, None))
+                    for k in range(common, len_b):
+                        pairs.append((None, j1 + k + 1))
             elif tag == "delete":
                 for i in range(i1, i2):
                     pairs.append((i + 1, None))
@@ -2823,6 +3117,24 @@ class SheetView:
             pos += 1
         return spans
 
+    def _apply_rownum_diff_tag_line(self, line_idx: int, pair_idx: int):
+        try:
+            if pair_idx >= len(self.row_pairs):
+                return
+            ra, rb = self.row_pairs[pair_idx]
+            if ra is not None:
+                la = len(str(ra))
+                if la > 0:
+                    self.left.tag_add("diffrownum", f"{line_idx}.0", f"{line_idx}.{la}")
+                    if self._is_three_way_enabled():
+                        self.base.tag_add("diffrownum", f"{line_idx}.0", f"{line_idx}.{la}")
+            if rb is not None:
+                lb = len(str(rb))
+                if lb > 0:
+                    self.right.tag_add("diffrownum", f"{line_idx}.0", f"{line_idx}.{lb}")
+        except Exception:
+            pass
+
     # ---------- Only-diff toggle ----------
     def _toggle_only_diff(self):
         # Snapshot mode confirmed by user: diff rows list is generated once when opening (or manual refresh).
@@ -2922,10 +3234,10 @@ class SheetView:
                 src_r = ra if ra is not None else rb
                 dst_r = ra if ra is not None else rb
             elif direction == "BASE2A":
-                if ra is None and rb is None:
+                if ra is None:
                     return
-                src_r = ra if ra is not None else rb
-                dst_r = ra if ra is not None else rb
+                src_r = ra
+                dst_r = ra
             else:
                 if rb is None:
                     return
@@ -3049,10 +3361,10 @@ class SheetView:
                 src_r = ra if ra is not None else rb
                 dst_r = ra if ra is not None else rb
             elif direction == "BASE2A":
-                if ra is None and rb is None:
+                if ra is None:
                     return
-                src_r = ra if ra is not None else rb
-                dst_r = ra if ra is not None else rb
+                src_r = ra
+                dst_r = ra
             else:
                 if rb is None:
                     return
@@ -3097,10 +3409,10 @@ class SheetView:
                 src_r = ra if ra is not None else rb
                 dst_r = ra if ra is not None else rb
             elif action_direction == "BASE2A":
-                if ra is None and rb is None:
+                if ra is None:
                     return
-                src_r = ra if ra is not None else rb
-                dst_r = ra if ra is not None else rb
+                src_r = ra
+                dst_r = ra
             else:
                 if rb is None:
                     return
@@ -3449,7 +3761,7 @@ class SheetView:
         if not pair:
             return ""
         ra, rb = pair
-        r = ra if ra is not None else rb
+        r = ra
         if r is None:
             return ""
         try:
@@ -3812,9 +4124,10 @@ class SheetView:
             self.right.insert(f"{line}.0", line_b)
 
             # clear tags on this line then apply diff highlight (unless touched row resolved)
-            for w in (self.left, self.right):
+            for w in (self.left, self.base, self.right):
                 w.tag_remove("diffrow", f"{line}.0", f"{line}.end")
                 w.tag_remove("diffcell", f"{line}.0", f"{line}.end")
+                w.tag_remove("diffrownum", f"{line}.0", f"{line}.end")
 
             cols = self.pair_diff_cols.get(pair_idx, set())
             # If this row was touched and has no diffs anymore, keep it visible but don't show diff highlight.
@@ -3823,6 +4136,7 @@ class SheetView:
                 self.left.tag_add("diffrow", f"{line}.0", f"{line}.end")
                 self.base.tag_add("diffrow", f"{line}.0", f"{line}.end")
                 self.right.tag_add("diffrow", f"{line}.0", f"{line}.end")
+                self._apply_rownum_diff_tag_line(line, pair_idx)
 
                 spans_a = self._spans_for_line(line_a)
                 spans_b = self._spans_for_line(line_b)
@@ -3840,6 +4154,10 @@ class SheetView:
                 mode = "只看差异" if self.only_diff_var.get() else "全量"
                 total_rows = len(self.row_pairs) if self.row_pairs else self.max_row
                 self.info.configure(text=f"{mode} | RowsShown: {len(self.display_rows)} / {total_rows}   Cols: {self.max_col}   DiffRows: {self._display_diff_row_count}")
+            except Exception:
+                pass
+            try:
+                self._update_diff_maps()
             except Exception:
                 pass
             return
@@ -3866,6 +4184,9 @@ class SheetView:
                 self.left.tag_remove("diffcell", "1.0", "end")
                 self.base.tag_remove("diffcell", "1.0", "end")
                 self.right.tag_remove("diffcell", "1.0", "end")
+                self.left.tag_remove("diffrownum", "1.0", "end")
+                self.base.tag_remove("diffrownum", "1.0", "end")
+                self.right.tag_remove("diffrownum", "1.0", "end")
                 self.left.tag_remove("paddingrow", "1.0", "end")
                 self.base.tag_remove("paddingrow", "1.0", "end")
                 self.right.tag_remove("paddingrow", "1.0", "end")
@@ -3877,6 +4198,12 @@ class SheetView:
                     self.left.tag_add("diffrow", *cached_diffrow_args)
                     self.base.tag_add("diffrow", *cached_diffrow_args)
                     self.right.tag_add("diffrow", *cached_diffrow_args)
+                    for line_idx in tag_rows:
+                        try:
+                            pidx = self.display_rows[line_idx - 1]
+                            self._apply_rownum_diff_tag_line(line_idx, pidx)
+                        except Exception:
+                            pass
                 if tag_cells:
                     cached_cell_left = []
                     cached_cell_right = []
@@ -3913,6 +4240,10 @@ class SheetView:
                 self.app.set_sheet_has_diff(self.sheet, diff_row_count > 0, confirmed=True)
                 self.app.refresh_sheet_nav()
                 self._update_diff_nav_state()
+                try:
+                    self._update_diff_maps()
+                except Exception:
+                    pass
                 return
 
         # Full render
@@ -3925,6 +4256,9 @@ class SheetView:
         self.left.tag_remove("diffcell", "1.0", "end")
         self.base.tag_remove("diffcell", "1.0", "end")
         self.right.tag_remove("diffcell", "1.0", "end")
+        self.left.tag_remove("diffrownum", "1.0", "end")
+        self.base.tag_remove("diffrownum", "1.0", "end")
+        self.right.tag_remove("diffrownum", "1.0", "end")
         self.left.tag_remove("paddingrow", "1.0", "end")
         self.base.tag_remove("paddingrow", "1.0", "end")
         self.right.tag_remove("paddingrow", "1.0", "end")
@@ -3997,6 +4331,12 @@ class SheetView:
             self.left.tag_add("diffrow", *diffrow_args)
             self.base.tag_add("diffrow", *diffrow_args)
             self.right.tag_add("diffrow", *diffrow_args)
+            for line_idx in tag_rows:
+                try:
+                    pidx = self.display_rows[line_idx - 1]
+                    self._apply_rownum_diff_tag_line(line_idx, pidx)
+                except Exception:
+                    pass
         # Apply all diffcell tags in one call per widget
         if diffcell_args_left:
             self.left.tag_add("diffcell", *diffcell_args_left)
@@ -4026,6 +4366,10 @@ class SheetView:
         self.app.set_sheet_has_diff(self.sheet, diff_row_count > 0, confirmed=True)
         self.app.refresh_sheet_nav()
         self._update_diff_nav_state()
+        try:
+            self._update_diff_maps()
+        except Exception:
+            pass
 
         # Cache rendered result for fast toggle
         if row_only is None:
@@ -4403,6 +4747,15 @@ class SowMergeApp:
 
             sig_a = _bulk_sig_list(ws_a, max_row_a)
             sig_b = _bulk_sig_list(ws_b, max_row_b)
+            def _sim_score(sa: str, sb: str) -> float:
+                if sa == sb:
+                    return 2.0
+                if (not sa) or (not sb):
+                    return 0.0
+                try:
+                    return difflib.SequenceMatcher(a=sa, b=sb, autojunk=False).ratio()
+                except Exception:
+                    return 0.0
             sm = difflib.SequenceMatcher(a=sig_a, b=sig_b, autojunk=False)
             pairs: list[tuple[int | None, int | None]] = []
             for tag, i1, i2, j1, j2 in sm.get_opcodes():
@@ -4413,12 +4766,30 @@ class SowMergeApp:
                     len_a = i2 - i1
                     len_b = j2 - j1
                     common = min(len_a, len_b)
+                    head_score = 0.0
+                    tail_score = 0.0
                     for k in range(common):
-                        pairs.append((i1 + k + 1, j1 + k + 1))
-                    for k in range(common, len_a):
-                        pairs.append((i1 + k + 1, None))
-                    for k in range(common, len_b):
-                        pairs.append((None, j1 + k + 1))
+                        head_score += _sim_score(sig_a[i1 + k], sig_b[j1 + k])
+                        tail_score += _sim_score(sig_a[i2 - common + k], sig_b[j2 - common + k])
+                    use_tail = tail_score >= head_score
+                    if use_tail:
+                        extra_a = len_a - common
+                        extra_b = len_b - common
+                        for k in range(extra_a):
+                            pairs.append((i1 + k + 1, None))
+                        for k in range(extra_b):
+                            pairs.append((None, j1 + k + 1))
+                        a_start = i2 - common
+                        b_start = j2 - common
+                        for k in range(common):
+                            pairs.append((a_start + k + 1, b_start + k + 1))
+                    else:
+                        for k in range(common):
+                            pairs.append((i1 + k + 1, j1 + k + 1))
+                        for k in range(common, len_a):
+                            pairs.append((i1 + k + 1, None))
+                        for k in range(common, len_b):
+                            pairs.append((None, j1 + k + 1))
                 elif tag == "delete":
                     for i in range(i1, i2):
                         pairs.append((i + 1, None))
