@@ -26,7 +26,7 @@ from openpyxl.utils import get_column_letter
 
 APP_NAME = "sow_merge_tool"
 APP_VERSION = "2026-03-02.perf1"
-APP_BUILD_TAG = "new56-visible-grid-overlay"
+APP_BUILD_TAG = "new57-merge-save-safety"
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
 _DEBUG_LOG_PATH = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_debug.log")
@@ -2740,8 +2740,10 @@ class SheetView:
                 old_val = self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value
                 v_edit = self.app.ws_base_edit(self.sheet).cell(row=src_r, column=c).value
                 v_val = self.app.ws_base_val(self.sheet).cell(row=src_r, column=c).value
-                self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c).value = v_val if _USE_CACHED_VALUES_ONLY else v_edit
+                new_edit = v_val if _USE_CACHED_VALUES_ONLY else v_edit
+                self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c).value = new_edit
                 self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value = v_val
+                self.app.record_manual_a_cell(self.sheet, dst_r, c, new_edit)
                 self.app.modified_a = True
                 self.app.modified_sheets_a.add(self.sheet)
                 self.app.push_undo({"sheet": self.sheet, "target": "A", "cells": [(dst_r, c, old_edit, old_val)]})
@@ -2750,8 +2752,10 @@ class SheetView:
                 old_val = self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value
                 v_edit = self.app.ws_b_edit(self.sheet).cell(row=src_r, column=c).value
                 v_val = self.app.ws_b_val(self.sheet).cell(row=src_r, column=c).value
-                self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c).value = v_val if _USE_CACHED_VALUES_ONLY else v_edit
+                new_edit = v_val if _USE_CACHED_VALUES_ONLY else v_edit
+                self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c).value = new_edit
                 self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value = v_val
+                self.app.record_manual_a_cell(self.sheet, dst_r, c, new_edit)
                 self.app.modified_a = True
                 self.app.modified_sheets_a.add(self.sheet)
                 self.app.push_undo({"sheet": self.sheet, "target": "A", "cells": [(dst_r, c, old_edit, old_val)]})
@@ -3322,8 +3326,10 @@ class SheetView:
                 old_val = self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value
                 v_edit = self.app.ws_b_edit(self.sheet).cell(row=src_r, column=c).value
                 v_val = self.app.ws_b_val(self.sheet).cell(row=src_r, column=c).value
-                self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c).value = v_val if _USE_CACHED_VALUES_ONLY else v_edit
+                new_edit = v_val if _USE_CACHED_VALUES_ONLY else v_edit
+                self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c).value = new_edit
                 self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value = v_val
+                self.app.record_manual_a_cell(self.sheet, dst_r, c, new_edit)
                 self.app.modified_a = True
                 self.app.modified_sheets_a.add(self.sheet)
                 self.app.push_undo({"sheet": self.sheet, "target": "A", "cells": [(dst_r, c, old_edit, old_val)]})
@@ -3337,8 +3343,10 @@ class SheetView:
                 old_val = self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value
                 v_edit = self.app.ws_base_edit(self.sheet).cell(row=src_r, column=c).value
                 v_val = self.app.ws_base_val(self.sheet).cell(row=src_r, column=c).value
-                self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c).value = v_val if _USE_CACHED_VALUES_ONLY else v_edit
+                new_edit = v_val if _USE_CACHED_VALUES_ONLY else v_edit
+                self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c).value = new_edit
                 self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value = v_val
+                self.app.record_manual_a_cell(self.sheet, dst_r, c, new_edit)
                 self.app.modified_a = True
                 self.app.modified_sheets_a.add(self.sheet)
                 self.app.push_undo({"sheet": self.sheet, "target": "A", "cells": [(dst_r, c, old_edit, old_val)]})
@@ -3499,8 +3507,10 @@ class SheetView:
                     old_val = ws_a_val.cell(row=dst_r, column=c).value
                     v_edit = ws_b_edit.cell(row=src_r, column=c).value
                     v_val = ws_b_val.cell(row=src_r, column=c).value
-                    ws_a_edit.cell(row=dst_r, column=c).value = v_val if _USE_CACHED_VALUES_ONLY else v_edit
+                    new_edit = v_val if _USE_CACHED_VALUES_ONLY else v_edit
+                    ws_a_edit.cell(row=dst_r, column=c).value = new_edit
                     ws_a_val.cell(row=dst_r, column=c).value = v_val
+                    self.app.record_manual_a_cell(self.sheet, dst_r, c, new_edit)
                     undo_cells.append((dst_r, c, old_edit, old_val))
                 self.app.modified_a = True
                 self.app.modified_sheets_a.add(self.sheet)
@@ -3520,8 +3530,10 @@ class SheetView:
                     old_val = ws_a_val.cell(row=dst_r, column=c).value
                     v_edit = ws_base_edit.cell(row=src_r, column=c).value
                     v_val = ws_base_val.cell(row=src_r, column=c).value
-                    ws_a_edit.cell(row=dst_r, column=c).value = v_val if _USE_CACHED_VALUES_ONLY else v_edit
+                    new_edit = v_val if _USE_CACHED_VALUES_ONLY else v_edit
+                    ws_a_edit.cell(row=dst_r, column=c).value = new_edit
                     ws_a_val.cell(row=dst_r, column=c).value = v_val
+                    self.app.record_manual_a_cell(self.sheet, dst_r, c, new_edit)
                     undo_cells.append((dst_r, c, old_edit, old_val))
                 self.app.modified_a = True
                 self.app.modified_sheets_a.add(self.sheet)
@@ -3570,6 +3582,12 @@ class SheetView:
                 ws_val = self.app.ws_a_val(sheet)
                 ws_edit.delete_rows(start_row, count)
                 ws_val.delete_rows(start_row, count)
+                try:
+                    keys_to_drop = [k for k in self.app.manual_a_cell_ops.keys() if k[0] == sheet and k[1] >= int(start_row)]
+                    for k in keys_to_drop:
+                        self.app.manual_a_cell_ops.pop(k, None)
+                except Exception:
+                    pass
                 self.app.modified_a = True
                 self.app.modified_sheets_a.add(sheet)
                 if sheet == self.sheet:
@@ -3594,6 +3612,8 @@ class SheetView:
             for r, c, old_edit, old_val in cells:
                 ws_edit.cell(row=r, column=c).value = old_edit
                 ws_val.cell(row=r, column=c).value = old_val
+                if target == "A":
+                    self.app.record_manual_a_cell(sheet, r, c, old_edit)
                 rows.add(r)
             # refresh current sheet if applicable
             if sheet == self.sheet:
@@ -3640,7 +3660,9 @@ class SheetView:
                 v_val = ws_b_val.cell(row=r, column=c).value
                 v_edit = ws_b_edit.cell(row=r, column=c).value
                 ws_a_val.cell(row=target_r, column=c).value = v_val
-                ws_a_edit.cell(row=target_r, column=c).value = v_val if _USE_CACHED_VALUES_ONLY else v_edit
+                new_edit = v_val if _USE_CACHED_VALUES_ONLY else v_edit
+                ws_a_edit.cell(row=target_r, column=c).value = new_edit
+                self.app.record_manual_a_cell(self.sheet, target_r, c, new_edit)
 
         self.app.modified_a = True
         self.app.modified_sheets_a.add(self.sheet)
@@ -4436,6 +4458,9 @@ class SowMergeApp:
             for cols in rows.values()
         )
         self.user_touched_conflicts = False
+        # In 3-way manual merge mode, persist only explicitly operated A-side cells on save.
+        # key: (sheet, row, col) -> edit value to write
+        self.manual_a_cell_ops: dict[tuple[str, int, int], object] = {}
         self.undo_stack = []
         self._auto_recalc_started = False
         # reset debug log each run
@@ -4588,6 +4613,21 @@ class SowMergeApp:
         if self._wb_base_val is None:
             raise KeyError("base workbook not available")
         return self._wb_base_val[sheet]
+
+    def record_manual_a_cell(self, sheet: str, r: int, c: int, edit_value):
+        try:
+            self.manual_a_cell_ops[(sheet, int(r), int(c))] = edit_value
+        except Exception:
+            pass
+
+    def build_manual_merge_output_wb(self):
+        """Build save output from fresh mine + explicit user operations only."""
+        wb_out = load_workbook(self.file_a, data_only=False)
+        for (sheet, r, c), v in self.manual_a_cell_ops.items():
+            if sheet not in wb_out.sheetnames:
+                continue
+            wb_out[sheet].cell(row=r, column=c).value = v
+        return wb_out
 
     def set_sheet_has_diff(self, sheet: str, has: bool, confirmed: bool = True):
         # Keep API: mark sheet diff state
@@ -5767,14 +5807,19 @@ class SowMergeApp:
                     return
             if not messagebox.askyesno("确认保存", f"将保存合并结果到：\n\n{self.merged_path}\n\n继续吗？"):
                 return
+        wb_to_save = self._wb_a_edit
         try:
             # Small delay to allow SVN/Tortoise to release file locks
             try:
                 time.sleep(1.2)
             except Exception:
                 pass
+            if self.merge_mode and self.has_base:
+                # Safety guard for manual 3-way mode:
+                # save from pristine mine + explicit operations only.
+                wb_to_save = self.build_manual_merge_output_wb()
             self._with_progress("保存中", f"正在保存合并结果：\n{self.merged_path}",
-                                lambda: self._atomic_save_with_retry(self._wb_a_edit, self.merged_path))
+                                lambda: self._atomic_save_with_retry(wb_to_save, self.merged_path))
             self.modified_a = False
             try:
                 messagebox.showinfo("Saved", f"已保存合并结果：\n{self.merged_path}")
@@ -5795,9 +5840,9 @@ class SowMergeApp:
                     base = os.path.basename(self.merged_path)
                     tmp_path = os.path.join(folder, f"~{base}.deferred.{os.getpid()}.tmp")
                     if _FAST_SAVE_VALUES_ONLY and _USE_CACHED_VALUES_ONLY:
-                        _save_values_only_from_wb(self._wb_a_edit, tmp_path)
+                        _save_values_only_from_wb(wb_to_save, tmp_path)
                     else:
-                        self._wb_a_edit.save(tmp_path)
+                        wb_to_save.save(tmp_path)
                     _launch_deferred_copy(tmp_path, self.merged_path)
                     messagebox.showinfo("保存中", f"目标文件被占用，已写入临时文件并将在关闭后自动覆盖：\n{self.merged_path}")
                     try:
@@ -5808,7 +5853,7 @@ class SowMergeApp:
                 except Exception:
                     diag = self._path_diagnostics(self.merged_path)
                     if messagebox.askyesno("保存失败", f"保存合并结果失败（可能文件被占用/无权限）：\n{e}\n\n诊断：{diag}\n\n是否另存为？"):
-                        if self._try_alt_save(self._wb_a_edit, self.merged_path, "MERGED"):
+                        if self._try_alt_save(wb_to_save, self.merged_path, "MERGED"):
                             try:
                                 self.root.destroy()
                             except Exception:
