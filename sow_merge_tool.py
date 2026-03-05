@@ -26,7 +26,7 @@ from openpyxl.utils import get_column_letter
 
 APP_NAME = "sow_merge_tool"
 APP_VERSION = "2026-03-02.perf1"
-APP_BUILD_TAG = "new57-merge-save-safety"
+APP_BUILD_TAG = "new58-merge-save-safety-logging"
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
 _DEBUG_LOG_PATH = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_debug.log")
@@ -4463,10 +4463,12 @@ class SowMergeApp:
         self.manual_a_cell_ops: dict[tuple[str, int, int], object] = {}
         self.undo_stack = []
         self._auto_recalc_started = False
-        # reset debug log each run
+        # append debug session marker each run (do not truncate old evidence)
         try:
-            with open(_DEBUG_LOG_PATH, "w", encoding="utf-8") as f:
-                f.write(f"{APP_NAME} {APP_VERSION}\n")
+            with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write("\n" + "=" * 72 + "\n")
+                f.write(f"SESSION {datetime.now().isoformat(sep=' ', timespec='seconds')}\n")
+                f.write(f"{APP_NAME} {APP_VERSION} [{APP_BUILD_TAG}]\n")
                 f.write(f"A={self.file_a}\nB={self.file_b}\n")
         except Exception:
             pass
@@ -5818,6 +5820,14 @@ class SowMergeApp:
                 # Safety guard for manual 3-way mode:
                 # save from pristine mine + explicit operations only.
                 wb_to_save = self.build_manual_merge_output_wb()
+            try:
+                _dlog(
+                    f"SAVE_MERGED path={self.merged_path} "
+                    f"merge_mode={self.merge_mode} has_base={self.has_base} "
+                    f"manual_a_ops={len(getattr(self, 'manual_a_cell_ops', {}))}"
+                )
+            except Exception:
+                pass
             self._with_progress("保存中", f"正在保存合并结果：\n{self.merged_path}",
                                 lambda: self._atomic_save_with_retry(wb_to_save, self.merged_path))
             self.modified_a = False
